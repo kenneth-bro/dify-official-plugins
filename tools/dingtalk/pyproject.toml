@@ -1,0 +1,15 @@
+[project]
+name = "dingtalk"
+version = "0.1.0"
+description = "DingTalk group bot plugin for Dify"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# Managed with uv; refresh the lockfile with `uv lock`.
+dependencies = [
+    "dify-plugin>=0.5.0",
+    "httpx>=0.28.1",
+]
+
+[dependency-groups]
+dev = []

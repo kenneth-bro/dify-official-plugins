@@ -1,0 +1,20 @@
+[project]
+name = "gitlab_datasource"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# Managed with uv; refresh the lockfile with `uv lock`.
+dependencies = [
+    "certifi",
+    "dify_plugin>=0.5.0",
+    "flask",
+    "markdown>=3.8.2",
+    "requests",
+    "urllib3",
+]
+
+# uv run black . -C -l 100 && uv run ruff check --fix
+[dependency-groups]
+dev = []

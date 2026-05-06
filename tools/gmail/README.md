@@ -15,6 +15,7 @@ A comprehensive Gmail integration plugin for Dify that provides essential mail-r
 - **Send Drafts**: Send previously created draft emails
 
 ### **Attachment Support**
+- **Download Attachments**: Download attachment content from emails
 - **Add Attachments**: Attach files to existing draft emails
 
 ### **Email Organization**
@@ -34,8 +35,6 @@ The plugin supports Gmail's powerful search syntax:
 - **Combined**: `from:boss@company.com subject:meeting after:2024/01/01 has:attachment`
 
 ## Setup Instructions
-
-**For detailed setup instructions, see [GUIDE.md](GUIDE.md)**
 
 ### Quick Setup Overview
 
@@ -100,6 +99,21 @@ parameters:
   action: "flag"
 ```
 
+### Download an Attachment
+```yaml
+# First, get message details with attachments
+tool: get_message
+parameters:
+  message_id: "18c1a2b3d4e5f6g7"
+  include_attachments: true
+
+# Then, download the attachment using the attachment_id from above
+tool: download_attachment
+parameters:
+  message_id: "18c1a2b3d4e5f6g7"
+  attachment_id: "ANGjdJ8wXYZ..."
+```
+
 ## Tool Reference
 
 ### Core Tools
@@ -107,7 +121,7 @@ parameters:
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
 | `search_messages` | Advanced Gmail search | `query`, `max_results`, `include_body` |
-| `get_message` | Get detailed message information | `message_id`, `include_body` |
+| `get_message` | Get detailed message information | `message_id`, `include_body`, `include_attachments` |
 
 ### Email Composition
 
@@ -122,6 +136,7 @@ parameters:
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
+| `download_attachment` | Download attachment content | `message_id`, `attachment_id` |
 | `add_attachment_to_draft` | Add file to draft | `draft_id`, `file_path` |
 | `flag_message` | Flag/unflag for follow-up | `message_id`, `action` |
 
@@ -168,4 +183,4 @@ This plugin is built using the Dify plugin framework and follows best practices:
 
 ## License
 
-This plugin is provided as-is for use with Dify. Please refer to Dify's licensing terms for usage rights. 
+This plugin is provided as-is for use with Dify. Please refer to Dify's licensing terms for usage rights.

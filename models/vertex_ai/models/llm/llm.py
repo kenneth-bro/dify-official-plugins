@@ -1,11 +1,14 @@
 import base64
 import io
 import json
+import logging
 import time
-from collections.abc import Generator, Sequence
-from typing import Optional, Union, cast
+from collections.abc import Generator, Mapping, Sequence
+from typing import Any, Optional, Union, cast
+
 import google.auth.transport.requests
 import requests
+from PIL import Image
 from anthropic import AnthropicVertex, Stream
 from anthropic.types import (
     ContentBlockDeltaEvent,
@@ -38,16 +41,95 @@ from dify_plugin.errors.model import (
     InvokeServerUnavailableError,
 )
 from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
-from google.api_core import exceptions
-from google.oauth2 import service_account
 from google import genai
+from google.api_core import exceptions
 from google.genai import types
-from PIL import Image
+from google.oauth2 import service_account
 
+GLOBAL_ONLY_MODELS_DEFAULT = [
+    "gemini-2.5-computer-use-preview-10-2025",
+    "gemini-2.5-flash-lite-preview-06-17",
+    "gemini-2.5-flash-lite-preview-09-2025",
+    "gemini-2.5-flash-preview-09-2025",
+    "gemini-2.5-pro-preview-06-05",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-image-preview",
+]
+IMAGE_GENERATION_MODELS = {
+    "gemini-3.1-flash-image-preview",
+}
 
-GLOBAL_ONLY_MODELS_DEFAULT = ["gemini-2.5-pro-preview-06-05","gemini-2.5-flash-lite-preview-06-17","gemini-2.5-flash-preview-09-2025","gemini-2.5-flash-lite-preview-09-2025"]
 # For more information about the models, please refer to https://ai.google.dev/gemini-api/docs/thinking
 DEFAULT_NO_THINKING_MODELS = ["gemini-2.5-flash-lite"]
+
+# Bypass thought signature validation for function calls in multi-turn conversations.
+# This is officially supported by Google for platforms that manage conversation history.
+# See: https://ai.google.dev/gemini-api/docs/thought-signatures#faqs
+DEFAULT_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
+
+# Separator used to encode thought_signature into ToolCall.id field
+# Format: "{function_name}::sig::{base64_encoded_signature}"
+SIGNATURE_SEPARATOR = "::sig::"
+
+logger = logging.getLogger(__name__)
+
+
+def _encode_tool_call_id(function_name: str, thought_signature: Optional[str]) -> str:
+    """
+    Encode function name and thought_signature into a single ToolCall.id string.
+    This allows persisting the signature across requests since ToolCall.id is preserved by Dify.
+    """
+    if thought_signature:
+        sig_b64 = base64.b64encode(thought_signature.encode()).decode()
+        return f"{function_name}{SIGNATURE_SEPARATOR}{sig_b64}"
+    return function_name
+
+
+def _decode_tool_call_id(tool_call_id: str) -> tuple[str, Optional[str]]:
+    """
+    Decode ToolCall.id back into function name and thought_signature.
+    Returns (function_name, signature) tuple. Signature may be None if not encoded.
+    """
+    if SIGNATURE_SEPARATOR in tool_call_id:
+        parts = tool_call_id.split(SIGNATURE_SEPARATOR, 1)
+        if len(parts) == 2:
+            try:
+                signature = base64.b64decode(parts[1]).decode()
+                return parts[0], signature
+            except Exception:
+                pass
+    return tool_call_id, None
+
+
+def _extract_thought_signature(part) -> Optional[str]:
+    """
+    Best-effort extractor for Vertex AI thought signatures from a Part.
+    Handles snake_case and camelCase, and tries dict/extraContent fallbacks.
+    """
+    # Direct attributes first
+    sig = getattr(part, "thought_signature", None) or getattr(part, "thoughtSignature", None)
+    if isinstance(sig, str) and sig:
+        return sig
+    # Try dict conversion if the SDK object supports it
+    try:
+        d = part.to_dict() if hasattr(part, "to_dict") else (getattr(part, "__dict__", {}) or {})
+        if isinstance(d, dict):
+            sig = d.get("thoughtSignature") or d.get("thought_signature")
+            if not sig:
+                extra = d.get("extraContent") or d.get("extra_content") or {}
+                if isinstance(extra, dict):
+                    g = extra.get("google")
+                    if isinstance(g, dict):
+                        sig = g.get("thought_signature")
+            if isinstance(sig, str) and sig:
+                return sig
+    except Exception:
+        pass
+    return None
+
 
 class VertexAiLargeLanguageModel(LargeLanguageModel):
     def _invoke(
@@ -120,7 +202,10 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             location = vertex_anthropic_location
         elif vertex_location:
             location = vertex_location
-        elif any(m in model for m in ["opus", "claude-3-5-sonnet", "claude-3-7-sonnet", "claude-sonnet-4", "claude-haiku-4-5", "claude-sonnet-4-5"]):
+        elif any(m in model for m in
+                 ["opus", "claude-3-5-sonnet", "claude-3-7-sonnet", "claude-sonnet-4", "claude-haiku-4-5",
+                  "claude-sonnet-4-5", "claude-opus-4-5", "claude-sonnet-4-6", "claude-opus-4-6",
+                  "claude-opus-4-7"]):
             location = "us-east5"
         else:
             location = "us-central1"
@@ -361,7 +446,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         tool_declarations = []
         for tool_config in tools:
             properties_for_schema = {}
-            
+
             # tool_config.parameters is guaranteed to be a dict by the Pydantic model
             parameters_input_dict = tool_config.parameters
             raw_properties = parameters_input_dict.get("properties", {})
@@ -375,40 +460,40 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                     raw_type_str = str(value_schema.get("type", "string")).upper()
                     # Map "SELECT" to "STRING" for GenAI SDK compatibility
                     final_type_for_prop = "STRING" if raw_type_str == "SELECT" else raw_type_str
-                    
+
                     prop_details = {
                         "type": final_type_for_prop,
                         "description": value_schema.get("description", ""),
                     }
-                    
+
                     enum_values = value_schema.get("enum")
                     # Add enum only if it's a non-empty list (OpenAPI recommendation)
                     if enum_values and isinstance(enum_values, list):
                         prop_details["enum"] = enum_values
-                    
+
                     properties_for_schema[key] = prop_details
 
             # Schema for the 'parameters' object of the function declaration
             parameters_schema_for_declaration = {
-                "type": "OBJECT", 
+                "type": "OBJECT",
                 "properties": properties_for_schema,
             }
-            
+
             required_params = parameters_input_dict.get("required")
             # Add required only if it's a non-empty list of strings (OpenAPI recommendation)
-            if required_params and isinstance(required_params, list) and all(isinstance(item, str) for item in required_params):
+            if required_params and isinstance(required_params, list) and all(
+                isinstance(item, str) for item in required_params):
                 parameters_schema_for_declaration["required"] = required_params
 
             # Create function declaration dict for GenAI SDK
             function_declaration = {
                 "name": tool_config.name,
-                "description": tool_config.description or "", 
+                "description": tool_config.description or "",
                 "parameters": parameters_schema_for_declaration
             }
             tool_declarations.append(function_declaration)
 
         return types.Tool(function_declarations=tool_declarations) if tool_declarations else None
-
 
     def validate_credentials(self, model: str, credentials: dict) -> None:
         """
@@ -431,6 +516,60 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             return [m.strip() for m in credentials["vertex_global_models"].split(",") if m.strip()]
         # Fallback to default if unsupported type
         return GLOBAL_ONLY_MODELS_DEFAULT
+
+    @staticmethod
+    def _set_image_config(
+        *,
+        config: types.GenerateContentConfig,
+        model_parameters: Mapping[str, Any],
+        model: str,
+    ):
+        if model not in IMAGE_GENERATION_MODELS:
+            return
+
+        aspect_ratio = model_parameters.get("aspect_ratio")
+        if (
+            not aspect_ratio
+            or not isinstance(aspect_ratio, str)
+            or aspect_ratio
+            not in [
+                "1:1",
+                "2:3",
+                "3:2",
+                "3:4",
+                "4:3",
+                "4:5",
+                "5:4",
+                "9:16",
+                "16:9",
+                "21:9",
+                "4:1",
+                "8:1",
+            ]
+        ):
+            aspect_ratio = None
+
+        resolution = model_parameters.get("resolution")
+        if (
+            not resolution
+            or not isinstance(resolution, str)
+            or resolution not in ["1K", "2K", "4K"]
+        ):
+            resolution = None
+
+        config.image_config = types.ImageConfig(
+            image_size=resolution, aspect_ratio=aspect_ratio
+        )
+
+    @staticmethod
+    def _set_response_modalities(
+        *, config: types.GenerateContentConfig, model_name: str
+    ) -> None:
+        if model_name in IMAGE_GENERATION_MODELS:
+            config.response_modalities = [
+                types.Modality.TEXT.value,
+                types.Modality.IMAGE.value,
+            ]
 
     def _generate(
         self,
@@ -456,28 +595,78 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         :return: full response or stream response chunk generator result
         """
         config_kwargs = model_parameters.copy()
-        config_kwargs["max_output_tokens"] = config_kwargs.pop("max_tokens_to_sample", None)
-        
+        if "max_tokens_to_sample" in config_kwargs:
+            config_kwargs["max_output_tokens"] = config_kwargs.pop("max_tokens_to_sample")
+
         # parse config kwargs
         tools_config = []
         thinking_config = {}
         for field in list(config_kwargs):
-            if field in ["include_thoughts", "thinking_budget"]:
+            if field in ["include_thoughts", "thinking_budget", "thinking_level"]:
                 thinking_config[field] = config_kwargs.pop(field)
-            elif field == "grounding_search":
-                if config_kwargs.pop("grounding_search", False):
+            elif field in ["grounding_search", "grounding"]:
+                if config_kwargs.pop(field, False):
                     tools_config.append(types.Tool(google_search=types.GoogleSearch()))
+            elif field == "url_context":
+                if config_kwargs.pop("url_context", False):
+                    tools_config.append(types.Tool(url_context=types.UrlContext()))
+            elif field == "code_execution":
+                if config_kwargs.pop("code_execution", False):
+                    tools_config.append(types.Tool(code_execution=types.ToolCodeExecution()))
             elif field in ["json_schema", "response_schema"]:
                 schema = self._convert_schema_for_vertex(config_kwargs.pop(field))
                 config_kwargs["response_schema"] = schema
                 config_kwargs["response_mime_type"] = "application/json"
             elif field == "response_mime_type":
                 config_kwargs["response_mime_type"] = config_kwargs.pop("response_mime_type")
+            elif field in ["aspect_ratio", "resolution"]:
+                config_kwargs.pop(field)
+            elif field == "media_resolution":
+                media_res = config_kwargs.pop("media_resolution")
+                if media_res == "Default":
+                    config_kwargs["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_UNSPECIFIED
+                elif media_res == "Low":
+                    config_kwargs["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_LOW
+                elif media_res == "Medium":
+                    config_kwargs["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
+                elif media_res == "High":
+                    config_kwargs["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_HIGH
         if tools:
             tools_config.append(self._convert_tools_to_genai_tool(tools))
 
         # Build config
+        # Image generation models do not support thinking config
+        if model in IMAGE_GENERATION_MODELS:
+            thinking_config = {}
         if thinking_config:
+            # Handle thinking_level conversion for Gemini 3
+            thinking_level_str = thinking_config.get("thinking_level")
+            if isinstance(thinking_level_str, str):
+                # Build level_map dynamically to handle SDK version differences
+                level_map = {}
+                if hasattr(types.ThinkingLevel, "MINIMAL"):
+                    level_map["Minimal"] = types.ThinkingLevel.MINIMAL
+                if hasattr(types.ThinkingLevel, "LOW"):
+                    level_map["Low"] = types.ThinkingLevel.LOW
+                if hasattr(types.ThinkingLevel, "MEDIUM"):
+                    level_map["Medium"] = types.ThinkingLevel.MEDIUM
+                if hasattr(types.ThinkingLevel, "HIGH"):
+                    level_map["High"] = types.ThinkingLevel.HIGH
+
+                if thinking_level_str in level_map:
+                    thinking_config["thinking_level"] = level_map[thinking_level_str]
+                else:
+                    # Fallback: remove unsupported thinking_level
+                    thinking_config.pop("thinking_level", None)
+
+            # thinking_budget and thinking_level are mutually exclusive
+            # Gemini 3 uses thinking_level, older models use thinking_budget
+            if "thinking_budget" in thinking_config and "thinking_level" in thinking_config:
+                if "gemini-3" in model:
+                    thinking_config.pop("thinking_budget", None)
+                else:
+                    thinking_config.pop("thinking_level", None)
+
             if thinking_config.get("include_thoughts", False) and \
                 thinking_config.get("thinking_budget", 1) == 0:
                 raise InvokeBadRequestError("Include Thoughts is only enabled when thinking budget is greater than 0.")
@@ -485,7 +674,8 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             # please refer to https://ai.google.dev/gemini-api/docs/thinking
             if thinking_config.get("include_thoughts", False) and \
                 (model in DEFAULT_NO_THINKING_MODELS and "thinking_budget" not in thinking_config):
-                raise InvokeBadRequestError(f"The {model} does not enable thinking by default. Include Thoughts is only enabled when thinking budget is set.")
+                raise InvokeBadRequestError(
+                    f"The {model} does not enable thinking by default. Include Thoughts is only enabled when thinking budget is set.")
             config_kwargs["thinking_config"] = types.ThinkingConfig(**thinking_config)
         if tools_config:
             config_kwargs["tools"] = tools_config
@@ -509,7 +699,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             location = "us-central1"
         else:
             location = credentials["vertex_location"]
-        
+
         # Initialize GenAI client
         if service_account_info:
             SCOPES = [
@@ -532,20 +722,25 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                 project=project_id,
                 location=location
             )
-            
+
         # Process messages and build content
         contents = []
-        
+
         for msg in prompt_messages:
-                content = self._format_message_to_genai_content(msg)
-                # Merge consecutive messages from the same role
-                if contents and contents[-1].get("role") == content.get("role"):
-                    # Merge parts from the same role
-                    contents[-1]["parts"].extend(content["parts"])
-                else:
-                    contents.append(content)
+            content = self._format_message_to_genai_content(msg)
+            # Skip None values (e.g., SystemPromptMessage returns None)
+            if content is None:
+                continue
+            # Merge consecutive messages from the same role
+            if contents and contents[-1].get("role") == content.get("role"):
+                # Merge parts from the same role
+                contents[-1]["parts"].extend(content["parts"])
+            else:
+                contents.append(content)
 
         config = types.GenerateContentConfig(**config_kwargs)
+        self._set_image_config(config=config, model_parameters=model_parameters, model=model)
+        self._set_response_modalities(config=config, model_name=model)
 
         # Generate content
         if stream:
@@ -554,7 +749,8 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                 contents=contents,
                 config=config
             )
-            return self._handle_generate_stream_response(model, credentials, response, prompt_messages, system_instruction)
+            return self._handle_generate_stream_response(model, credentials, response, prompt_messages,
+                                                         system_instruction, client)
         else:
             response = client.models.generate_content(
                 model=model,
@@ -564,7 +760,8 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             return self._handle_generate_response(model, credentials, response, prompt_messages)
 
     def _handle_generate_response(
-        self, model: str, credentials: dict, response: types.GenerateContentResponse, prompt_messages: list[PromptMessage]
+        self, model: str, credentials: dict, response: types.GenerateContentResponse,
+        prompt_messages: list[PromptMessage]
     ) -> LLMResult:
         """
         Handle llm response
@@ -584,24 +781,62 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                 for part in candidate.content.parts:
                     # Check for function call
                     if hasattr(part, 'function_call') and part.function_call:
+                        # Extract thought_signature and encode it into the ToolCall.id
+                        # This allows the signature to persist across requests
+                        sig = _extract_thought_signature(part)
+                        func_name = part.function_call.name
+                        tool_call_id = _encode_tool_call_id(func_name, sig)
+
                         tool_call = AssistantPromptMessage.ToolCall(
-                            id=part.function_call.name,
+                            id=tool_call_id,
                             type="function",
                             function=AssistantPromptMessage.ToolCall.ToolCallFunction(
-                                name=part.function_call.name,
-                                arguments=json.dumps(dict(part.function_call.args)) if hasattr(part.function_call, 'args') else "{}",
+                                name=func_name,
+                                arguments=json.dumps(dict(part.function_call.args)) if hasattr(part.function_call,
+                                                                                               'args') else "{}",
                             ),
                         )
                         assistant_prompt_message.tool_calls.append(tool_call)
+                    # Check for inline_data (image)
+                    elif hasattr(part, 'inline_data') and part.inline_data:
+                        inline_data = part.inline_data
+                        mime_type = inline_data.mime_type
+                        data = inline_data.data
+                        if mime_type and data and mime_type.startswith("image/"):
+                            mime_subtype = mime_type.split("/", maxsplit=1)[-1]
+                            # Switch to list content for image responses
+                            if isinstance(assistant_prompt_message.content, str):
+                                text_so_far = assistant_prompt_message.content
+                                content_list = []
+                                if text_so_far:
+                                    content_list.append(TextPromptMessageContent(data=text_so_far))
+                                assistant_prompt_message.content = content_list
+                            assistant_prompt_message.content.append(
+                                ImagePromptMessageContent(
+                                    format=mime_subtype,
+                                    base64_data=base64.b64encode(data).decode(),
+                                    mime_type=mime_type,
+                                    detail=ImagePromptMessageContent.DETAIL.HIGH,
+                                )
+                            )
                     # Check for text
                     elif hasattr(part, 'text') and part.text:
-                        if part.thought is True and not is_thinking:
-                            assistant_prompt_message.content += "<think>\n\n"
-                            is_thinking = True
-                        elif part.thought is None and is_thinking:
-                            assistant_prompt_message.content += "\n\n</think>"
-                            is_thinking = False
-                        assistant_prompt_message.content += part.text
+                        if isinstance(assistant_prompt_message.content, list):
+                            if part.thought is True and not is_thinking:
+                                assistant_prompt_message.content.append(TextPromptMessageContent(data="<think>\n\n"))
+                                is_thinking = True
+                            elif part.thought is None and is_thinking:
+                                assistant_prompt_message.content.append(TextPromptMessageContent(data="\n\n</think>"))
+                                is_thinking = False
+                            assistant_prompt_message.content.append(TextPromptMessageContent(data=part.text))
+                        else:
+                            if part.thought is True and not is_thinking:
+                                assistant_prompt_message.content += "<think>\n\n"
+                                is_thinking = True
+                            elif part.thought is None and is_thinking:
+                                assistant_prompt_message.content += "\n\n</think>"
+                                is_thinking = False
+                            assistant_prompt_message.content += part.text
 
         prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
         completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
@@ -610,7 +845,9 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         return result
 
     def _handle_generate_stream_response(
-        self, model: str, credentials: dict, response: Generator, prompt_messages: list[PromptMessage], system_instruction: str
+        self, model: str, credentials: dict, response: Generator, prompt_messages: list[PromptMessage],
+        system_instruction: str,
+        genai_client: genai.Client
     ) -> Generator:
         """
         Handle llm stream response
@@ -620,8 +857,12 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         :param response: response stream generator
         :param prompt_messages: prompt messages
         :param system_instruction: system instruction
+        :param genai_client: genai client to keep alive during streaming
         :return: llm response chunk generator result
         """
+        # Keep a reference to the client to prevent it from being garbage collected
+        # while the generator is still active
+        _client_ref = genai_client
         index = -1
         is_first_gemini2_response = True
         is_thinking = False
@@ -629,27 +870,51 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             # GenAI SDK returns GenerateContentResponse objects
             if not hasattr(chunk, 'candidates') or not chunk.candidates:
                 continue
-                
+
             candidate = chunk.candidates[0]
-            
+
             if not hasattr(candidate, 'content') or not candidate.content or not candidate.content.parts:
                 continue
-                
+
             for part in candidate.content.parts:
                 assistant_prompt_message = AssistantPromptMessage(content="", tool_calls=[])
 
                 # Check for function call
                 if hasattr(part, 'function_call') and part.function_call:
+                    # Extract thought_signature and encode it into the ToolCall.id
+                    sig = _extract_thought_signature(part)
+                    func_name = part.function_call.name
+                    tool_call_id = _encode_tool_call_id(func_name, sig)
+
                     assistant_prompt_message.tool_calls.append(
                         AssistantPromptMessage.ToolCall(
-                            id=part.function_call.name,
+                            id=tool_call_id,
                             type="function",
                             function=AssistantPromptMessage.ToolCall.ToolCallFunction(
-                                name=part.function_call.name,
-                                arguments=json.dumps(dict(part.function_call.args)) if hasattr(part.function_call, 'args') else "{}",
+                                name=func_name,
+                                arguments=json.dumps(dict(part.function_call.args)) if hasattr(part.function_call,
+                                                                                               'args') else "{}",
                             ),
                         )
                     )
+                # Check for inline_data (image)
+                elif hasattr(part, 'inline_data') and part.inline_data:
+                    inline_data = part.inline_data
+                    mime_type = inline_data.mime_type
+                    data = inline_data.data
+                    if mime_type and data and mime_type.startswith("image/"):
+                        mime_subtype = mime_type.split("/", maxsplit=1)[-1]
+                        assistant_prompt_message = AssistantPromptMessage(
+                            content=[
+                                ImagePromptMessageContent(
+                                    format=mime_subtype,
+                                    base64_data=base64.b64encode(data).decode(),
+                                    mime_type=mime_type,
+                                    detail=ImagePromptMessageContent.DETAIL.HIGH,
+                                )
+                            ],
+                            tool_calls=[],
+                        )
                 # Check for text
                 elif hasattr(part, 'text') and part.text:
                     if part.thought is True and not is_thinking:
@@ -661,10 +926,10 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                     assistant_prompt_message.content += part.text
 
                 index += 1
-                
+
                 # Check if this is the final chunk
                 has_finish_reason = hasattr(candidate, "finish_reason") and candidate.finish_reason
-                
+
                 if not has_finish_reason:
                     yield LLMResultChunk(
                         model=model,
@@ -676,10 +941,24 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                     completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
                     usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
 
+                    # For image responses (list content), skip grounding/reference processing
+                    if isinstance(assistant_prompt_message.content, list):
+                        yield LLMResultChunk(
+                            model=model,
+                            prompt_messages=prompt_messages,
+                            delta=LLMResultChunkDelta(
+                                index=index,
+                                message=assistant_prompt_message,
+                                finish_reason=str(candidate.finish_reason) if candidate.finish_reason else None,
+                                usage=usage,
+                            ),
+                        )
+                        continue
+
                     # Extract grounding metadata if present
                     reference_lines = []
                     grounding_chunks = []
-                    
+
                     try:
                         if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
                             grounding_chunks = candidate.grounding_metadata.grounding_chunks or []
@@ -703,15 +982,15 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                         reference_section = "\n\nGrounding Sources\n" + "\n".join(reference_lines)
                     else:
                         reference_section = ""
-                    
+
                     if is_first_gemini2_response and model.startswith("gemini-2.") and system_instruction:
                         integrated_text = f"{assistant_prompt_message.content}"
                         is_first_gemini2_response = False
                     else:
                         integrated_text = f"{assistant_prompt_message.content}{reference_section}"
-                    
+
                     assistant_message_with_refs = AssistantPromptMessage(
-                        content=integrated_text, 
+                        content=integrated_text,
                         tool_calls=assistant_prompt_message.tool_calls
                     )
 
@@ -782,15 +1061,22 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             return {"role": "user", "parts": parts}
         elif isinstance(message, AssistantPromptMessage):
             if message.tool_calls:
-                parts = [
-                    {
+                parts = []
+                for tool_call in message.tool_calls:
+                    # Decode thought_signature from ToolCall.id if present
+                    # Falls back to bypass signature if not encoded
+                    _, signature = _decode_tool_call_id(tool_call.id)
+                    if not signature:
+                        signature = DEFAULT_THOUGHT_SIGNATURE
+
+                    part_dict = {
                         "function_call": {
                             "name": tool_call.function.name,
                             "args": json.loads(tool_call.function.arguments),
-                        }
+                        },
+                        "thought_signature": signature,
                     }
-                    for tool_call in message.tool_calls
-                ]
+                    parts.append(part_dict)
             else:
                 parts = [{"text": message.content}]
             return {"role": "model", "parts": parts}
@@ -807,7 +1093,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                 ]
             }
         elif isinstance(message, SystemPromptMessage):
-            return None    
+            return None
         else:
             raise ValueError(f"Got unknown type {message}")
 
@@ -878,7 +1164,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             # Define keys that expect lists
             list_keys = {"enum", "required"}
             # Define keys that expect strings
-            string_keys = {"description", "format"} # Removed 'type' for special handling
+            string_keys = {"description", "format"}  # Removed 'type' for special handling
             # Define keys that expect numbers
             number_keys = {"minimum", "maximum"}
             # Define keys that expect integers
@@ -886,7 +1172,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             # Define keys that expect booleans
             boolean_keys = {"nullable"}
             # Vertex AI specific key
-            vertex_specific_keys = {"propertyOrdering"} # Expects a list
+            vertex_specific_keys = {"propertyOrdering"}  # Expects a list
 
             # All known keys *except* 'type' which has special handling below
             known_keys_minus_type = (
@@ -910,8 +1196,8 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                         converted_schema["type"] = "STRING"
                         converted_schema["nullable"] = True
                     elif type_set == {"number", "string"}:
-                         # Convert ["number", "string"] to type: STRING
-                         converted_schema["type"] = "STRING"
+                        # Convert ["number", "string"] to type: STRING
+                        converted_schema["type"] = "STRING"
                     # Add more elif conditions here for other list types if needed in the future
                     # Example: elif type_set == {"integer", "null"}:
                     #             converted_schema["type"] = "INTEGER"
@@ -931,54 +1217,53 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                     )
             # --- End Special Handling for 'type' key ---
 
-
             # --- Process other keys ---
             for key, value in schema.items():
                 if key == "type":
-                    continue # Already handled above
+                    continue  # Already handled above
 
                 if key in nested_schema_keys:
                     if isinstance(value, dict):
-                         if key == "properties":
-                             converted_props = {}
-                             for prop_name, prop_def in value.items():
-                                 # Recursively convert property definitions
-                                 converted_props[prop_name] = self._convert_schema_for_vertex(prop_def)
-                             converted_schema[key] = converted_props
-                         elif key == "items":
-                              # Recursively convert item definition
-                              converted_schema[key] = self._convert_schema_for_vertex(value)
+                        if key == "properties":
+                            converted_props = {}
+                            for prop_name, prop_def in value.items():
+                                # Recursively convert property definitions
+                                converted_props[prop_name] = self._convert_schema_for_vertex(prop_def)
+                            converted_schema[key] = converted_props
+                        elif key == "items":
+                            # Recursively convert item definition
+                            converted_schema[key] = self._convert_schema_for_vertex(value)
                     else:
-                         raise ValueError(
-                             f"Invalid schema: Value for '{key}' key must be a dictionary, "
-                             f"but got {type(value).__name__}. Schema snippet: {{'{key}': {value}}}"
-                         )
+                        raise ValueError(
+                            f"Invalid schema: Value for '{key}' key must be a dictionary, "
+                            f"but got {type(value).__name__}. Schema snippet: {{'{key}': {value}}}"
+                        )
                 elif key in list_keys | vertex_specific_keys:
-                     if isinstance(value, list):
-                         if key == "required" and not all(isinstance(item, str) for item in value):
-                             raise ValueError(f"Invalid schema: All items in 'required' list must be strings.")
-                         # Copy list values directly for enum, required, propertyOrdering
-                         converted_schema[key] = value
-                     else:
-                         raise ValueError(
-                             f"Invalid schema: Value for '{key}' key must be a list, "
-                             f"but got {type(value).__name__}. Schema snippet: {{'{key}': {value}}}"
-                         )
+                    if isinstance(value, list):
+                        if key == "required" and not all(isinstance(item, str) for item in value):
+                            raise ValueError(f"Invalid schema: All items in 'required' list must be strings.")
+                        # Copy list values directly for enum, required, propertyOrdering
+                        converted_schema[key] = value
+                    else:
+                        raise ValueError(
+                            f"Invalid schema: Value for '{key}' key must be a list, "
+                            f"but got {type(value).__name__}. Schema snippet: {{'{key}': {value}}}"
+                        )
                 elif key in known_keys_minus_type:
-                     # For other known keys, copy the value directly.
-                     if key == "nullable" and not isinstance(value, bool):
-                          # Allow nullable to be set by the type conversion logic above
-                          if key not in converted_schema: # Only raise if not already set by type logic
+                    # For other known keys, copy the value directly.
+                    if key == "nullable" and not isinstance(value, bool):
+                        # Allow nullable to be set by the type conversion logic above
+                        if key not in converted_schema:  # Only raise if not already set by type logic
                             raise ValueError(f"Invalid schema: Value for 'nullable' must be boolean.")
-                     elif key == "nullable" and key in converted_schema:
-                         # If type logic set nullable=True, don't overwrite with potentially false value from original schema
-                         pass
-                     else:
+                    elif key == "nullable" and key in converted_schema:
+                        # If type logic set nullable=True, don't overwrite with potentially false value from original schema
+                        pass
+                    else:
                         converted_schema[key] = value
                 else:
                     # Handle unknown keys: Ignore them as they are likely unsupported by Vertex AI
                     # print(f"Warning: Unknown schema key '{key}' encountered. Ignoring.")
-                    pass # Ignore unknown keys
+                    pass  # Ignore unknown keys
 
             return converted_schema
 
@@ -991,7 +1276,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             if isinstance(schema, (int, str, bool, float)) or schema is None:
                 return schema
             else:
-                 raise ValueError(f"Invalid schema component type: {type(schema).__name__}")
+                raise ValueError(f"Invalid schema component type: {type(schema).__name__}")
 
     def _get_system_instruction(self, *, prompt_messages: Sequence[PromptMessage]) -> str:
         # `prompt_messages` should be a sequence containing at least one

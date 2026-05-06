@@ -1,9 +1,9 @@
 description:
   human:
-    en_US: Azure OpenAI Image Edit (gpt-image-1) is a tool to modify one or more images based on a prompt, generating a single edited result.
-    pt_BR: Azure OpenAI Image Edit (gpt-image-1) é uma ferramenta para modificar uma ou mais imagens com base em um prompt, gerando um único resultado editado.
-    zh_Hans: Azure OpenAI Image Edit (gpt-image-1) 是一个工具，可根据提示词修改一张或多张图像，生成单个编辑结果。
-  llm: A tool to edit one or more images using OpenAI's gpt-image-1 model, combining them based on a prompt to generate a single edited result.
+    en_US: Azure OpenAI Image Edit is a tool to modify one or more images based on a prompt, generating a single edited result.
+    pt_BR: Azure OpenAI Image Edit é uma ferramenta para modificar uma ou mais imagens com base em um prompt, gerando um único resultado editado.
+    zh_Hans: Azure OpenAI Image Edit 是一个工具，可根据提示词修改一张或多张图像，生成单个编辑结果。
+  llm: A tool to edit one or more images using Azure OpenAI's image model, combining them based on a prompt to generate a single edited result.
 extra:
   python:
     source: tools/image_edit.py
@@ -85,8 +85,25 @@ parameters:
           pt_BR: Paisagem (1536x1024)
           zh_Hans: 横屏/风景 (1536x1024)
         value: "1536x1024"
+      - label:
+          en_US: Custom
+          pt_BR: Personalizado
+          zh_Hans: 自定义
+        value: custom
     required: false
     type: select
+  - form: form
+    human_description:
+      en_US: Optional custom output size for GPT-image-2 style deployments. Use a WxH string such as 1024x1024. This field is used only when Image size is set to Custom.
+      pt_BR: Tamanho de saída personalizado opcional para implantações no estilo GPT-image-2. Use um texto no formato WxH, como 1024x1024. Este campo só é usado quando o Tamanho da imagem está definido como Personalizado.
+      zh_Hans: 面向 GPT-image-2 类部署的可选自定义输出尺寸。请使用 WxH 字符串，例如 1024x1024。仅当上方图像大小设置为“自定义”时才会使用此字段。
+    label:
+      en_US: Custom Size
+      pt_BR: Tamanho personalizado
+      zh_Hans: 自定义尺寸
+    name: custom_size
+    required: false
+    type: string
   - default: 1
     form: form
     human_description:

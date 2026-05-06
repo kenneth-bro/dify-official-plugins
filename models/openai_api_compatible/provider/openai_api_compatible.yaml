@@ -34,6 +34,7 @@ model_credential_schema:
         en_US: The display name of the model in the interface.
     - variable: api_key
       label:
+        zh_Hans: API Key
         en_US: API Key
       type: secret-input
       required: false
@@ -105,6 +106,7 @@ model_credential_schema:
         - variable: __model_type
           value: llm
       label:
+        zh_Hans: 对话类型
         en_US: Completion mode
       type: select
       required: false
@@ -134,6 +136,19 @@ model_credential_schema:
       placeholder:
         zh_Hans: 在此输入您的模型上下文长度
         en_US: Enter your Model context size
+    - variable: max_chunks
+      label:
+        zh_Hans: 模型每批的最大分块数
+        en_US: Model max chunks per batch
+      required: true
+      show_on:
+        - variable: __model_type
+          value: text-embedding
+      type: text-input
+      default: "1"
+      placeholder:
+        zh_Hans: 在此输入您的模型每批次的最大分块数量
+        en_US: Enter your Model maximum chunks per batch size
     - variable: context_size
       label:
         zh_Hans: 模型上下文长度
@@ -147,6 +162,25 @@ model_credential_schema:
       placeholder:
         zh_Hans: 在此输入您的模型上下文长度
         en_US: Enter your Model context size
+    - variable: vision_support
+      show_on:
+        - variable: __model_type
+          value: text-embedding
+      label:
+        zh_Hans: 视觉支持
+        en_US: Vision Support
+      type: select
+      required: false
+      default: no_support
+      options:
+        - value: support
+          label:
+            en_US: Support
+            zh_Hans: 支持
+        - value: no_support
+          label:
+            en_US: Not Support
+            zh_Hans: 不支持
     - variable: context_size
       label:
         zh_Hans: 模型上下文长度
@@ -160,6 +194,25 @@ model_credential_schema:
       placeholder:
         zh_Hans: 在此输入您的模型上下文长度
         en_US: Enter your Model context size
+    - variable: vision_support
+      show_on:
+        - variable: __model_type
+          value: rerank
+      label:
+        zh_Hans: 视觉支持
+        en_US: Vision Support
+      type: select
+      required: false
+      default: no_support
+      options:
+        - value: support
+          label:
+            en_US: Support
+            zh_Hans: 支持
+        - value: no_support
+          label:
+            en_US: Not Support
+            zh_Hans: 不支持
     - variable: max_tokens_to_sample
       label:
         zh_Hans: 最大 token 上限
@@ -169,30 +222,87 @@ model_credential_schema:
           value: llm
       default: "4096"
       type: text-input
-    - variable: agent_though_support
+    - variable: agent_thought_support
       show_on:
         - variable: __model_type
           value: llm
       label:
-        en_US: Agent Thought
+        en_US: Thinking Mode Support
+        zh_Hans: 思考模式支持
       type: select
       required: false
       default: not_supported
       options:
-        - value: supported
+        - value: only_thinking_supported
           label:
-            en_US: Support
-            zh_Hans: 支持
+            en_US: Only Thinking Mode
+            zh_Hans: 仅支持思考模式
         - value: not_supported
           label:
-            en_US: Not Support
-            zh_Hans: 不支持
+            en_US: Only Non-Thinking Mode
+            zh_Hans: 仅支持非思考模式
+        - value: supported
+          label:
+            en_US: Both Modes
+            zh_Hans: 两种模式都支持
+      help:
+        en_US: Configure whether the model supports thinking mode, non-thinking mode, or both. This will control the availability of the thinking mode toggle.
+        zh_Hans: 配置模型是否支持思考模式、非思考模式或两者都支持。这将控制思考模式开关的可用性。
+    - variable: compatibility_mode
+      show_on:
+        - variable: __model_type
+          value: llm
+      label:
+        en_US: Compatibility mode
+        zh_Hans: 兼容模式
+      type: select
+      required: false
+      default: strict
+      options:
+        - value: strict
+          label:
+            en_US: OpenAI compatible
+            zh_Hans: 严格（OpenAI 兼容）
+        - value: extended
+          label:
+            en_US: Enable extra settings
+            zh_Hans: 扩展（启用额外设置）
+      help:
+        en_US: Choose strict OpenAI compatibility or extended settings that add extra parameters (e.g., thinking, chat_template_kwargs, enable_thinking).
+        zh_Hans: 选择严格的 OpenAI 兼容或扩展设置（会添加额外参数，例如 thinking、chat_template_kwargs、enable_thinking）。
+    - variable: token_param_name
+      show_on:
+        - variable: __model_type
+          value: llm
+      label:
+        en_US: Token parameter name
+        zh_Hans: token 参数名
+      type: select
+      required: false
+      default: auto
+      options:
+        - value: auto
+          label:
+            en_US: Auto (detect by model)
+            zh_Hans: 自动（按模型判断）
+        - value: max_tokens
+          label:
+            en_US: Use max_tokens
+            zh_Hans: 使用 max_tokens
+        - value: max_completion_tokens
+          label:
+            en_US: Use max_completion_tokens
+            zh_Hans: 使用 max_completion_tokens
+      help:
+        en_US: Some OpenAI-compatible endpoints require max_completion_tokens (Responses API). Choose explicitly if auto-detection is wrong.
+        zh_Hans: 一些兼容端要求使用 max_completion_tokens（Responses API）。若自动判断不准确，可在此显式指定。
     - variable: function_calling_type
       show_on:
         - variable: __model_type
           value: llm
       label:
-        en_US: Function calling
+        zh_Hans: 函数调用类型
+        en_US: Function Call Type
       type: select
       required: false
       default: no_call
@@ -200,11 +310,11 @@ model_credential_schema:
         - value: function_call
           label:
             en_US: Function Call
-            zh_Hans: Function Call
+            zh_Hans: 函数调用
         - value: tool_call
           label:
             en_US: Tool Call
-            zh_Hans: Tool Call
+            zh_Hans: 工具调用
         - value: no_call
           label:
             en_US: Not Support
@@ -214,6 +324,7 @@ model_credential_schema:
         - variable: __model_type
           value: llm
       label:
+        zh_Hans: 流式函数调用
         en_US: Stream function calling
       type: select
       required: false
@@ -232,7 +343,7 @@ model_credential_schema:
         - variable: __model_type
           value: llm
       label:
-        zh_Hans: Vision 支持
+        zh_Hans: 视觉支持
         en_US: Vision Support
       type: select
       required: false
@@ -251,6 +362,7 @@ model_credential_schema:
         - variable: __model_type
           value: llm
       label:
+        zh_Hans: 结构化输出
         en_US: Structured Output
       type: select
       required: false
@@ -269,6 +381,7 @@ model_credential_schema:
         - variable: __model_type
           value: llm
       label:
+        zh_Hans: 流模式授权
         en_US: Stream mode auth
       type: select
       required: false

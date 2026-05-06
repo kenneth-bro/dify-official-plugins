@@ -1,0 +1,279 @@
+name: Pre PR Check Per Plugin
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review, review_requested]
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect-changes:
+    runs-on: depot-ubuntu-24.04
+    outputs:
+      plugins: ${{ steps.filter.outputs.plugins }}
+      has_changes: ${{ steps.filter.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Fetch changed file list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate \
+            "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files?per_page=100" \
+            --jq '.[] | [.status, .filename] | @tsv' > "$RUNNER_TEMP/changed-files.tsv"
+
+      - id: filter
+        name: Detect changed plugins
+        env:
+          CHANGED_FILES_FILE: ${{ runner.temp }}/changed-files.tsv
+          EXPECTED_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: .github/scripts/detect-changed-plugins.sh
+
+  test:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: depot-ubuntu-24.04-4
+    strategy:
+      matrix:
+        plugin_path: ${{ fromJson(needs.detect-changes.outputs.plugins) }}
+      fail-fast: false
+
+    # Using the full plugin path as the environment name
+    environment: ${{ matrix.plugin_path }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Resolve external tool versions
+        id: external
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "toolkit_sha=$(gh api repos/langgenius/dify-marketplace-toolkit/commits/HEAD --jq .sha)" >> $GITHUB_OUTPUT
+          echo "cli_tag=$(gh release view -R langgenius/dify-plugin-daemon --json tagName --jq .tagName)" >> $GITHUB_OUTPUT
+
+      - name: Cache .scripts (toolkit + CLI)
+        id: scripts-cache
+        uses: actions/cache@v4
+        with:
+          path: .scripts
+          key: scripts-${{ steps.external.outputs.toolkit_sha }}-${{ steps.external.outputs.cli_tag }}
+
+      - name: Clone Marketplace Toolkit
+        if: steps.scripts-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh repo clone langgenius/dify-marketplace-toolkit -- .scripts/
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+          activate-environment: false
+          enable-cache: true
+          cache-dependency-glob: |
+            ${{ matrix.plugin_path }}/uv.lock
+            ${{ matrix.plugin_path }}/requirements.txt
+
+      - name: yq - portable yaml processor
+        uses: mikefarah/yq@v4.44.5
+
+      - name: Download Dify CLI
+        if: steps.scripts-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ steps.external.outputs.cli_tag }}" -R langgenius/dify-plugin-daemon --pattern "dify-plugin-linux-amd64" --dir .scripts
+          chmod +x .scripts/dify-plugin-linux-amd64
+          mv .scripts/dify-plugin-linux-amd64 .scripts/dify
+
+      - name: Expose Dify CLI to PATH
+        run: |
+          echo "$GITHUB_WORKSPACE/.scripts" >> $GITHUB_PATH
+          echo "DIFY_CLI_PATH=$GITHUB_WORKSPACE/.scripts/dify" >> $GITHUB_ENV
+
+      - name: Export All Secrets to Environment
+        uses: oNaiPs/secrets-to-env-action@v1
+        with:
+          secrets: ${{ toJSON(secrets) }}
+          exclude: GITHUB_TOKEN, ORG_SCOPE_GITHUB_TOKEN, RAG_SSH_HOST, MARKETPLACE_TOKEN
+
+      - name: Check Plugin Manifest Author
+        run: |
+          if ! yq '.author' "${{ matrix.plugin_path }}/manifest.yaml" | grep -q "langgenius"; then
+            echo "!!! Plugin manifest.yaml author must be langgenius"
+            exit 1
+          fi
+
+      - name: Check If Version Exists
+        run: |
+          VERSION=$(yq '.version' "${{ matrix.plugin_path }}/manifest.yaml")
+          AUTHOR=$(yq '.author' "${{ matrix.plugin_path }}/manifest.yaml")
+          NAME=$(yq '.name' "${{ matrix.plugin_path }}/manifest.yaml")
+          echo "Checking plugin version: $VERSION"
+
+          RESPONSE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${{ secrets.MARKETPLACE_BASE_URL }}/api/v1/plugins/$AUTHOR/$NAME/$VERSION")
+
+          if [ "$RESPONSE_CODE" = "200" ]; then
+            RESPONSE=$(curl -s "${{ secrets.MARKETPLACE_BASE_URL }}/api/v1/plugins/$AUTHOR/$NAME/$VERSION")
+            if [ "$(echo "$RESPONSE" | jq -r '.code')" = "0" ]; then
+              echo "!!! Plugin version $VERSION already exists, please update the version number in manifest.yaml"
+              exit 1
+            fi
+          fi
+
+      - name: Check for Disallowed Virtualenv Directories
+        run: |
+          if find "${{ matrix.plugin_path }}" -maxdepth 1 -type d \( -name ".venv*" -o -name "venv*" \) | grep -q .; then
+            echo "!!! Please remove .venv or venv* directory in plugin path before submitting the PR"
+            exit 1
+          fi
+
+      - name: Check Plugin pyproject.toml
+        run: |
+          cd "${{ matrix.plugin_path }}"
+          if [ ! -f "pyproject.toml" ]; then
+            echo "!!! pyproject.toml is required for all plugins"
+            exit 1
+          fi
+
+      - name: Check Packaging
+        run: |
+          uv run --with requests --with dify_plugin python .scripts/uploader/upload-package.py -d "${{ matrix.plugin_path }}" -t "${{ secrets.MARKETPLACE_TOKEN }}" --plugin-daemon-path .scripts/dify -u "${{ secrets.MARKETPLACE_BASE_URL }}" -f --test
+
+      - name: Package plugin
+        run: |
+          SAFE_NAME=$(echo "${{ matrix.plugin_path }}" | tr '/' '-')
+          PKG_NAME="test-${SAFE_NAME}-package.difypkg"
+          EXTRACT_DIR="test-${SAFE_NAME}-unpacked"
+
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+          echo "PKG_NAME=$PKG_NAME" >> $GITHUB_ENV
+          echo "EXTRACT_DIR=$EXTRACT_DIR" >> $GITHUB_ENV
+
+          echo "### Packaging plugin at: ${{ matrix.plugin_path }} ###"
+          .scripts/dify plugin package ${{ matrix.plugin_path }} --output_path "$PKG_NAME"
+
+          echo "### Extracting package ###"
+          unzip -q "$PKG_NAME" -d "$EXTRACT_DIR"
+
+      - name: Validate Dependencies
+        run: |
+          cd "${{ matrix.plugin_path }}"
+
+          VENV_DIR="$RUNNER_TEMP/plugin-shared-venv"
+          rm -rf "$VENV_DIR"
+
+          if [ -f "uv.lock" ]; then
+            UV_PROJECT_ENVIRONMENT="$VENV_DIR" uv sync --all-groups --frozen --python 3.12
+          elif [ -f "requirements.txt" ]; then
+            uv venv "$VENV_DIR" --python 3.12
+            uv pip install --python "$VENV_DIR/bin/python" -r requirements.txt
+          else
+            echo "!!! uv.lock or requirements.txt is required for dependency validation"
+            exit 1
+          fi
+
+          echo "PLUGIN_VENV=$VENV_DIR" >> "$GITHUB_ENV"
+
+      - name: Check Plugin Install
+        run: |
+          export INSTALL_METHOD=serverless
+          export SERVERLESS_PORT=8080
+          export SERVERLESS_HOST=0.0.0.0
+
+          cleanup() {
+            rm -rf "$PLUGIN_VENV"
+          }
+          trap cleanup EXIT
+
+          if [ -f "${{ matrix.plugin_path }}/uv.lock" ]; then
+            UV_PROJECT_ENVIRONMENT="$PLUGIN_VENV" uv run --project "${{ matrix.plugin_path }}" --frozen --with requests python .scripts/validator/test-plugin-install.py -d "${{ matrix.plugin_path }}"
+          elif [ -f "${{ matrix.plugin_path }}/requirements.txt" ]; then
+            uv pip install --python "$PLUGIN_VENV/bin/python" requests
+            "$PLUGIN_VENV/bin/python" .scripts/validator/test-plugin-install.py -d "${{ matrix.plugin_path }}"
+          else
+            echo "!!! uv.lock or requirements.txt is required for plugin install validation"
+            exit 1
+          fi
+
+      - name: Check for tests directory
+        id: check_tests
+        run: |
+          if [ -d "${{ env.EXTRACT_DIR }}/tests" ]; then
+            echo "has_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_tests=false" >> $GITHUB_OUTPUT
+            echo "No tests directory found in plugin"
+          fi
+
+      - name: Install dependencies
+        if: steps.check_tests.outputs.has_tests == 'true'
+        working-directory: ${{ env.EXTRACT_DIR }}
+        run: |
+          if [ -f "uv.lock" ]; then
+            UV_PROJECT_ENVIRONMENT=".ci-test-uv-venv" uv sync --all-groups --frozen --python 3.12
+          elif [ -f "requirements.txt" ]; then
+            uv venv ".ci-test-venv" --python 3.12
+            uv pip install --python ".ci-test-venv/bin/python" -r requirements.txt
+            uv pip install --python ".ci-test-venv/bin/python" pytest
+          else
+            echo "!!! uv.lock or requirements.txt is required for test dependency installation"
+            exit 1
+          fi
+
+      - name: Run tests
+        if: steps.check_tests.outputs.has_tests == 'true'
+        working-directory: ${{ env.EXTRACT_DIR }}
+        run: |
+          export PLUGIN_FILE_PATH="$(realpath ../${{ env.PKG_NAME }})" 
+          if [ -f "uv.lock" ]; then
+            UV_PROJECT_ENVIRONMENT=".ci-test-uv-venv" uv run --frozen --with pytest pytest
+          else
+            .ci-test-venv/bin/python -m pytest
+          fi
+
+  check-complete:
+    name: Check Complete
+    needs:
+      - detect-changes
+      - test
+    if: always()
+    runs-on: depot-ubuntu-24.04
+    steps:
+      - name: Verify check results
+        run: |
+          if [ "${{ needs.detect-changes.result }}" != "success" ]; then
+            echo "detect-changes failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.detect-changes.outputs.has_changes }}" != "true" ]; then
+            echo "No plugin changes detected."
+            exit 0
+          fi
+
+          if [ "${{ needs.test.result }}" = "success" ]; then
+            echo "Plugin checks passed."
+            exit 0
+          fi
+
+          echo "Plugin checks failed."
+          exit 1

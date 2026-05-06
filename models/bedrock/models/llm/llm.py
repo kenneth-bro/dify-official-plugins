@@ -79,6 +79,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         {"prefix": "qwen.qwen3", "support_system_prompts": True, "support_tool_use": False},
         {"prefix": "openai.gpt", "support_system_prompts": True, "support_tool_use": False},
         {"prefix": "deepseek.v3-v1:0", "support_system_prompts": True, "support_tool_use": False},
+        {"prefix": "deepseek.v3.2", "support_system_prompts": True, "support_tool_use": True},
         {"prefix": "us.deepseek", "support_system_prompts": True, "support_tool_use": False},
         {"prefix": "global.anthropic.claude", "support_system_prompts": True, "support_tool_use": True},
         {"prefix": "us.anthropic.claude", "support_system_prompts": True, "support_tool_use": True},
@@ -124,7 +125,14 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         """
         Code block mode wrapper for invoking large language model
         """
-        if model_parameters.get("response_format"):
+        # When Dify's structured output is enabled, the Dify backend detects the "json_schema"
+        # parameter in the model YAML and passes the user-defined schema via model_parameters.
+        # We intercept it here and forward it to Bedrock's native outputConfig (Converse API),
+        # which uses constrained decoding to guarantee schema-compliant JSON output.
+        if model_parameters.get("json_schema"):
+            model_parameters.pop("response_format", None)
+            model_parameters["_structured_output_schema"] = model_parameters.pop("json_schema")
+        elif model_parameters.get("response_format"):
             stop = stop or []
             if "```\n" not in stop:
                 stop.append("```\n")
@@ -174,19 +182,25 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             try:
                 model_info = self._get_model_info(model, credentials, model_parameters)
                 if model_info:
+                    # Native Bedrock Structured Outputs: json_schema takes priority.
+                    # Same logic as _code_block_mode_wrapper — intercept the schema before
+                    # the legacy response_format handling runs.
+                    if model_parameters.get("json_schema"):
+                        model_parameters.pop("response_format", None)
+                        model_parameters["_structured_output_schema"] = model_parameters.pop("json_schema")
                     # Handle response_format for inference profiles only if underlying model is Anthropic
-                    if model_parameters.get("response_format"):
+                    elif model_parameters.get("response_format"):
                         # Check if the underlying model is Anthropic based
                         profile_info = get_inference_profile_info(inference_profile_id, credentials)
                         underlying_models = profile_info.get("models", [])
                         is_anthropic = False
-                        
+
                         if underlying_models:
                             first_model_arn = underlying_models[0].get("modelArn", "")
                             if "foundation-model/" in first_model_arn:
                                 underlying_model_id = first_model_arn.split("foundation-model/")[1]
                                 is_anthropic = "anthropic.claude" in underlying_model_id
-                        
+
                         if is_anthropic:
                             stop = stop or []
                             if "```\n" not in stop:
@@ -207,7 +221,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                         else:
                             # For non-Anthropic models, just remove response_format parameter
                             model_parameters.pop("response_format", None)
-                    
+
                     return self._generate_with_converse(
                         model_info, credentials, prompt_messages, model_parameters, stop, stream, user, tools, model
                     )
@@ -223,7 +237,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                 return self._generate_with_converse(
                     model_info, credentials, prompt_messages, model_parameters, stop, stream, user, tools, model
                 )
-            
+
             # Fallback to traditional model ID for non-converse API models
             model_name = model_parameters.get('model_name')
             if not model_name:
@@ -238,7 +252,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
     def _get_model_info(self, model: str, credentials: dict, model_parameters: dict) -> dict:
         """
         Get model information for converse API
-        
+
         :param model: model name
         :param credentials: model credentials
         :param model_parameters: model parameters
@@ -287,38 +301,22 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             if 'model_parameters' not in credentials:
                 credentials['model_parameters'] = {}
             credentials['model_parameters']['model_name'] = model_name
-            
+
             # Get region prefix for model ID construction
             region_name = credentials['aws_region']
             region_prefix = None
-            
-            if model_parameters.pop('cross-region', False):
+            cross_region = model_parameters.pop('cross-region', 'disabled')
+
+            if cross_region in ('geographic', 'global'):
                 # Cross-region inference enabled
-                # Check if the model supports global prefix (currently mainly Claude 4 series)
-                supports_global = any(model_id.startswith(prefix) for prefix in [
-                    'anthropic.claude-sonnet-4', 'anthropic.claude-sonnet-4-5'
-                ])
-                
-                if supports_global:
-                    # Prefer using global prefix
-                    region_prefix = model_ids.get_region_area(region_name, prefer_global=True)
-                else:
-                    # Use traditional regional prefix
-                    region_prefix = model_ids.get_region_area(region_name, prefer_global=False)
-                
+                prefer_global = (cross_region == 'global')
+                region_prefix = model_ids.get_region_area(region_name, prefer_global=prefer_global)
+
                 if not region_prefix:
                     raise InvokeError(f'Failed to get cross-region inference prefix for region {region_name}')
 
                 if not model_ids.is_support_cross_region(model_id):
                     raise InvokeError(f"Model {model_id} doesn't support cross-region inference")
-                
-                model_id = "{}.{}".format(region_prefix, model_id)
-            elif model_ids.is_support_cross_region(model_id):
-                # Cross-region inference not enabled, but still add region prefix for all models
-                region_prefix = model_ids.get_region_area(region_name, prefer_global=False)
-                
-                if not region_prefix:
-                    raise InvokeError(f'Failed to get region prefix for region {region_name}')
 
                 model_id = "{}.{}".format(region_prefix, model_id)
 
@@ -327,7 +325,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             if model_info:
                 model_info["model"] = model_id
                 return model_info
-            
+
             return None
 
     def _generate_with_converse(
@@ -392,6 +390,31 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             "inferenceConfig": inference_config,
             "additionalModelRequestFields": additional_model_fields,
         }
+
+        # Bedrock native Structured Outputs via Converse API outputConfig.
+        # When a user-defined JSON schema is provided (from Dify's structured output UI),
+        # we inject it into the Converse API's outputConfig.textFormat parameter.
+        # Bedrock uses constrained decoding to guarantee the response conforms to the schema.
+        # Requires boto3 >= 1.42.42.
+        # See: https://docs.aws.amazon.com/bedrock/latest/userguide/structured-output.html
+        structured_schema = model_parameters.pop("_structured_output_schema", None)
+        if structured_schema:
+            if isinstance(structured_schema, str):
+                schema_dict = json.loads(structured_schema)
+            else:
+                schema_dict = structured_schema
+            # Dify wraps the user schema as {"schema": {...}, "name": "llm_response"}
+            parameters["outputConfig"] = {
+                "textFormat": {
+                    "type": "json_schema",
+                    "structure": {
+                        "jsonSchema": {
+                            "schema": json.dumps(schema_dict.get("schema", schema_dict)),
+                            "name": schema_dict.get("name", "response"),
+                        }
+                    }
+                }
+            }
 
         if model_info["support_system_prompts"] and system and len(system) > 0:
             parameters["system"] = system
@@ -962,7 +985,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         :return:md = genai.GenerativeModel(model)
         """
         model_parts = model.split(".")
-        
+
         prefix = ""
         model_name = ""
         if model.startswith('us.') or model.startswith('eu.'):
@@ -984,7 +1007,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
     def get_customizable_model_schema(self, model: str, credentials: dict) -> Optional[AIModelEntity]:
         """
         Get customizable model schema for inference profiles
-        
+
         :param model: model name
         :param credentials: model credentials
         :return: AIModelEntity
@@ -994,11 +1017,11 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             try:
                 # Get inference profile info from AWS directly
                 profile_info = get_inference_profile_info(inference_profile_id, credentials)
-                
+
                 # Extract model name from profile
                 profile_name = profile_info.get("inferenceProfileName", model)
                 context_length = int(credentials.get("context_length", 4096))
-                
+
                 # Find matching predefined model based on underlying model ARN
                 default_pricing = None
                 matched_features = []
@@ -1008,30 +1031,30 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                     "context_size": context_length,
                 }
                 underlying_models = profile_info.get("models", [])
-                
+
                 if underlying_models:
                     first_model_arn = underlying_models[0].get("modelArn", "")
                     if "foundation-model/" in first_model_arn:
                         underlying_model_id = first_model_arn.split("foundation-model/")[1]
                         model_schemas = self.predefined_models()
-                        
+
                         # Try to get model-specific pricing based on the underlying model ID
                         # Map model ID to model name for pricing lookup
                         model_name_for_pricing = self._map_model_id_to_name(underlying_model_id)
-                        
+
                         # First try to find individual model schema for pricing
                         if model_name_for_pricing:
                             individual_pricing = self._get_model_specific_pricing("", model_name_for_pricing, model_schemas)
                             if individual_pricing:
                                 default_pricing = individual_pricing
-                        
+
                         # Then find matching schema for features and parameters
                         for model_schema in model_schemas:
                             if self._model_id_matches_schema(underlying_model_id, model_schema):
                                 # Use individual pricing if found, otherwise fall back to schema pricing
                                 if not default_pricing:
                                     default_pricing = model_schema.pricing
-                                    
+
                                 matched_features = model_schema.features or []
                                 # Extract allowed parameters from model schema, excluding model_name since it's determined by inference profile
                                 matched_parameter_rules = self._get_inference_profile_parameter_rules(model_schema, underlying_model_id)
@@ -1040,13 +1063,13 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                                     # Override context_size with user-specified value
                                     matched_model_properties["context_size"] = context_length
                                 break
-                
+
                 # Fallback to first predefined model pricing if no match found
                 if not default_pricing:
                     model_schemas = self.predefined_models()
                     if model_schemas:
                         default_pricing = model_schemas[0].pricing
-                
+
                 # Use the user-provided model name exactly as entered
                 # Create custom model entity based on inference profile
                 return AIModelEntity(
@@ -1079,7 +1102,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                 if model_schemas and model_schemas[0].model_properties:
                     fallback_model_properties.update(model_schemas[0].model_properties)
                     fallback_model_properties["context_size"] = context_length
-                
+
                 return AIModelEntity(
                     model=model,
                     label=I18nObject(en_US=model),
@@ -1090,7 +1113,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                     parameter_rules=fallback_parameter_rules,
                     pricing=default_pricing
                 )
-        
+
         # This should not be reached for inference profile models, but keep as final fallback
         return None
 
@@ -1106,12 +1129,17 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         if 'auth_method' not in credentials:
             raise CredentialsValidateFailedError("Authentication method 'auth_method' is missing in credentials.")
 
+        inference_profile_id = credentials.get("inference_profile_id")
+        if inference_profile_id:
+            validate_inference_profile(inference_profile_id, credentials)
+            logger.info(f"Successfully validated inference profile: {inference_profile_id}")
+
         try:
             if credentials['auth_method'] == 'IAM_Role':
                 return
             elif credentials['auth_method'] == 'Access_Secret_Key':
                 if credentials['aws_access_key_id'] and credentials['aws_secret_access_key']:
-                    return 
+                    return
             elif credentials['auth_method'] == 'API_Key':
                 if credentials['bedrock_api_key']:
                     return
@@ -1479,23 +1507,23 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
     def _get_inference_profile_parameter_rules(self, model_schema, underlying_model_id: str = None) -> list:
         """
         Extract allowed parameter rules from model schema for inference profiles
-        
+
         :param model_schema: The predefined model schema
         :param underlying_model_id: The underlying model ID (for model-specific filtering)
         :return: List of parameter rules suitable for inference profiles
         """
         if not model_schema.parameter_rules:
             return []
-        
+
         # Always exclude model_name since it's determined by inference profile
         excluded_params = ['model_name']
-        
+
         # Apply model-specific filtering if underlying_model_id is available
         allowed_parameter_rules = []
         for rule in model_schema.parameter_rules:
             if rule.name in excluded_params:
                 continue
-                
+
             # For Anthropic models, include response_format only if it's an Anthropic model
             if rule.name == 'response_format':
                 if underlying_model_id and "anthropic.claude" not in underlying_model_id:
@@ -1504,28 +1532,28 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                     # Fallback case: only include if this is an Anthropic schema
                     if not (hasattr(model_schema, 'model') and model_schema.model == "anthropic claude"):
                         continue
-            
+
             allowed_parameter_rules.append(rule)
-        
+
         return allowed_parameter_rules
 
     def _model_id_matches_schema(self, model_id: str, model_schema) -> bool:
         """
         Check if a model ID matches a predefined model schema
-        
+
         :param model_id: The model ID from inference profile (e.g., anthropic.claude-3-5-sonnet-20241022-v2:0)
         :param model_schema: The predefined model schema
         :return: True if the model ID matches the schema
         """
         # Extract the model family from the model ID and check individual models first
         if "anthropic.claude" in model_id:
-            return (model_schema.model == "anthropic claude" or 
+            return (model_schema.model == "anthropic claude" or
                    model_schema.model.startswith("claude-"))
         elif "amazon.nova" in model_id:
-            return (model_schema.model == "amazon nova" or 
+            return (model_schema.model == "amazon nova" or
                    model_schema.model.startswith("nova-"))
         elif "cohere.command" in model_id:
-            return (model_schema.model == "cohere" or 
+            return (model_schema.model == "cohere" or
                    model_schema.model.startswith("cohere-"))
         elif "ai21" in model_id:
             return model_schema.model == "ai21"
@@ -1535,22 +1563,22 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             return model_schema.model == "mistral"
         elif "deepseek" in model_id:
             return model_schema.model == "deepseek"
-        
+
         return False
-    
+
     def _map_model_id_to_name(self, model_id: str) -> Optional[str]:
         """
         Map a Bedrock model ID to a model name for pricing lookup.
-        
+
         :param model_id: The Bedrock model ID (e.g., 'anthropic.claude-3-5-sonnet-20241022-v2:0')
         :return: The model name or None
         """
         # Reverse lookup from model_ids
         from . import model_ids
-        
+
         # Remove version suffix if present
         base_model_id = model_id.split(':')[0] if ':' in model_id else model_id
-        
+
         # Search through all model families
         for family, models in model_ids.BEDROCK_MODEL_IDS.items():
             for name, id_value in models.items():
@@ -1558,14 +1586,14 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                 base_id_value = id_value.split(':')[0] if ':' in id_value else id_value
                 if base_id_value == base_model_id or id_value == model_id:
                     return name
-        
+
         return None
-    
+
     def _get_model_specific_pricing(self, model: str, model_name: str, model_schemas: list):
         """
         Get model-specific pricing based on model name.
         First tries to find exact model match from model_configurations directory, then falls back to family pricing.
-        
+
         :param model: The model family (e.g., 'anthropic-claude')
         :param model_name: The specific model name (e.g., 'Claude 3.5 Sonnet')
         :param model_schemas: List of predefined model schemas
@@ -1578,7 +1606,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             'Claude 4.0 Opus': 'claude-4-opus',
             'Claude 3.7 Sonnet': 'claude-3-7-sonnet',
             'Claude 3.5 Haiku': 'claude-3-5-haiku',
-            'Claude 3.5 Sonnet': 'claude-3-5-sonnet', 
+            'Claude 3.5 Sonnet': 'claude-3-5-sonnet',
             'Claude 3.5 Sonnet V2': 'claude-3-5-sonnet',
             'Claude 3 Haiku': 'claude-3-haiku',
             'Claude 3 Sonnet': 'claude-3-sonnet',
@@ -1593,7 +1621,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             'Command R': 'cohere-command-r',
             'Command R+': 'cohere-command-rplus'
         }
-        
+
         # First, try to load individual model pricing from model_configurations subdirectory
         individual_model_name = model_name_mapping.get(model_name)
         if individual_model_name:
@@ -1603,7 +1631,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                 # Get the directory of this file
                 current_dir = os.path.dirname(os.path.abspath(__file__))
                 individual_model_path = os.path.join(current_dir, 'model_configurations', f'{individual_model_name}.yaml')
-                
+
                 if os.path.exists(individual_model_path):
                     with open(individual_model_path, 'r', encoding='utf-8') as f:
                         model_config = yaml.safe_load(f)
@@ -1612,23 +1640,23 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             except Exception as e:
                 # If individual model file loading fails, continue to fallback
                 pass
-        
+
         # Fallback: try to find individual model in existing schemas (for backward compatibility)
         if individual_model_name:
             for schema in model_schemas:
                 if schema.model == individual_model_name:
                     return schema.pricing
-        
+
         # If no model family provided, skip family pricing lookup
         if not model:
             return None
-        
+
         # If no individual model found, try family pricing
         # Look for exact model match first
         for schema in model_schemas:
             if schema.model == model:
                 return schema.pricing
-        
+
         # If exact match not found, try with different formats
         # Sometimes model might be passed as 'anthropic claude' vs 'anthropic-claude'
         model_variants = [
@@ -1638,18 +1666,18 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             model.lower().replace('-', ' '),
             model.lower().replace(' ', '-')
         ]
-        
+
         for schema in model_schemas:
             for variant in model_variants:
                 if schema.model == variant:
                     return schema.pricing
-                    
+
         return None
-    
+
     def _calc_response_usage(self, model: str, credentials: dict, prompt_tokens: int, completion_tokens: int):
         """
         Calculate response usage with per-model pricing support.
-        
+
         :param model: model name
         :param credentials: model credentials
         :param prompt_tokens: number of prompt tokens
@@ -1659,16 +1687,16 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         # Get model-specific pricing if available
         model_parameters = credentials.get('model_parameters', {})
         model_name = model_parameters.get('model_name')
-        
+
         if model_name:
             # Try to get model-specific pricing
             model_schemas = self.predefined_models()
             model_pricing = self._get_model_specific_pricing(model, model_name, model_schemas)
-            
+
             if model_pricing:
                 # Use model-specific pricing
                 from dify_plugin.entities.model.llm import LLMUsage
-                
+
                 # Handle both dict and object pricing formats
                 if isinstance(model_pricing, dict):
                     input_price = float(model_pricing['input'])
@@ -1681,19 +1709,19 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                     output_price = float(model_pricing.output)
                     unit_price = float(model_pricing.unit)
                     currency = model_pricing.currency
-                
+
                 # Calculate costs correctly: (tokens × price) ÷ unit_tokens
                 input_cost = (prompt_tokens * input_price) / (1.0 / unit_price)
                 output_cost = (completion_tokens * output_price) / (1.0 / unit_price)
-                
+
                 # Round to avoid floating point precision issues
                 input_cost = round(input_cost, 8)
                 output_cost = round(output_cost, 8)
                 total_cost = round(input_cost + output_cost, 8)
-                
+
                 # Get latency from parent class by calling it first
                 parent_usage = super()._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
-                
+
                 return LLMUsage(
                     prompt_tokens=prompt_tokens,
                     prompt_unit_price=input_price,
@@ -1708,7 +1736,6 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                     currency=currency,
                     latency=parent_usage.latency,  # Use parent's latency calculation
                 )
-        
+
         # Fallback to parent class implementation
         return super()._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
-    
