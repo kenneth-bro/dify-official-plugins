@@ -297,10 +297,13 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
             params["messages"] = self._convert_prompt_messages_to_tongyi_messages(
                 credentials, prompt_messages, rich_content=True
             )
+            # [CUSTOM-i] Disable Alibaba Cloud content inspection (绿网) and merge with market bury point header
+            _call_headers = self._get_market_bury_point_header(params["messages"], extra_headers_str)
+            _call_headers["X-DashScope-DataInspection"] = '{"input":"disable","output":"disable"}'
             response = MultiModalConversation.call(
                 **params,
                 stream=stream,
-                headers=self._get_market_bury_point_header(params["messages"], extra_headers_str),
+                headers=_call_headers,
                 incremental_output=incremental_output,
                 base_address=base_address,
             )
@@ -308,14 +311,19 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
             params["messages"] = self._convert_prompt_messages_to_tongyi_messages(
                 credentials, prompt_messages
             )
+            # [CUSTOM-i] Disable Alibaba Cloud content inspection (绿网) and merge with market bury point header
+            _call_headers = self._get_market_bury_point_header(params["messages"], extra_headers_str)
+            _call_headers["X-DashScope-DataInspection"] = '{"input":"disable","output":"disable"}'
             response = Generation.call(
                 **params,
-                headers=self._get_market_bury_point_header(params["messages"], extra_headers_str),
+                headers=_call_headers,
                 result_format="message",
                 stream=stream,
                 incremental_output=incremental_output,
                 base_address=base_address,
             )
+        # [CUSTOM-i] Pass debug_logging flag from provider credentials
+        debug_logging = credentials.get("debug_logging", "false") == "true"
         if stream:
             return self._handle_generate_stream_response(
                 model,
@@ -323,9 +331,10 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                 response,
                 prompt_messages,
                 incremental_output,
+                debug_logging=debug_logging,
             )
         return self._handle_generate_response(
-            model, credentials, response, prompt_messages
+            model, credentials, response, prompt_messages, debug_logging=debug_logging
         )
 
     def _handle_generate_response(
@@ -334,6 +343,7 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         credentials: dict,
         response: GenerationResponse,
         prompt_messages: list[PromptMessage],
+        debug_logging: bool = False,
     ) -> LLMResult:
         """
         Handle llm response
@@ -372,6 +382,9 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                 prompt_messages=prompt_messages,
                 usage=usage,
             )
+            # [CUSTOM-i] Log request_id for tracing with Alibaba Cloud support (controlled by debug_logging credential)
+            if debug_logging:
+                logger.info("dashscope model=%s request_id=%s", model, response.request_id)
             return result
         finally:
             self._cleanup_temp_files()
@@ -405,6 +418,7 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         responses: Generator[GenerationResponse, None, None],
         prompt_messages: list[PromptMessage],
         incremental_output: bool,
+        debug_logging: bool = False,
     ) -> Generator:
         """
         Handle llm stream response
@@ -468,6 +482,12 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                     usage = self._calc_response_usage(
                         model, credentials, usage.input_tokens, usage.output_tokens
                     )
+                    # [CUSTOM-i] Log request_id and merged response content for tracing with Alibaba Cloud support
+                    if debug_logging:
+                        logger.info(
+                            "dashscope model=%s request_id=%s full_text=%.500s",
+                            model, response.request_id, full_text,
+                        )
                     yield LLMResultChunk(
                         model=model,
                         prompt_messages=prompt_messages,

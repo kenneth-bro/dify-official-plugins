@@ -124,6 +124,23 @@ provider_credential_schema:
           en_US: "False"
           zh_Hans: "否"
         value: "false"
+  # [CUSTOM-i] Debug logging toggle: logs request_id and response content for Alibaba Cloud support tracing
+  - label:
+      en_US: Debug Logging
+      zh_Hans: 调试日志
+    type: radio
+    required: true
+    default: "false"
+    variable: debug_logging
+    options:
+      - label:
+          en_US: "Enabled"
+          zh_Hans: "开启"
+        value: "true"
+      - label:
+          en_US: "Disabled"
+          zh_Hans: "关闭"
+        value: "false"
 supported_model_types:
   - llm
   - text-embedding
