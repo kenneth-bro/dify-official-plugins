@@ -83,7 +83,11 @@ models:
   llm:
     position: models/llm/_position.yaml
     predefined:
-      - models/llm/*.yaml
+      # [CUSTOM-i] Limit default predefined LLM models; other Tongyi models can still be configured as customizable models.
+      - models/llm/qwen3.5-plus.yaml
+      - models/llm/qwen3.6-plus.yaml
+      - models/llm/qwen3.5-flash.yaml
+      - models/llm/qwen-plus.yaml
   rerank:
     position: models/rerank/_position.yaml
     predefined:
