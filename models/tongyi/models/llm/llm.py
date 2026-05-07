@@ -60,12 +60,18 @@ from dify_plugin.errors.model import (
     InvokeRateLimitError,
     InvokeServerUnavailableError,
 )
+from dify_plugin.config.logger_format import plugin_logger_handler
 from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
 from openai import OpenAI
 from models._common import get_http_base_address
 from ..constant import BURY_POINT_HEADER
 
 logger = logging.getLogger(__name__)
+# [CUSTOM-i] Route plugin logs through Dify's stdout JSON log event handler so plugin-daemon can capture them
+logger.setLevel(logging.INFO)
+if plugin_logger_handler not in logger.handlers:
+    logger.addHandler(plugin_logger_handler)
+logger.propagate = False
 
 
 class TongyiLargeLanguageModel(LargeLanguageModel):
@@ -183,6 +189,8 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         :param user: unique user id
         :return: full response or stream response chunk generator result
         """
+        # [CUSTOM-i] Private Dify context moved into credentials because the plugin SDK filters model_parameters.
+        workflow_run_id = credentials.pop("dify_workflow_run_id", None) or credentials.pop("_dify_workflow_run_id", None)
         credentials_kwargs = self._to_credential_kwargs(credentials)
         mode = self.get_model_mode(model, credentials)
         if model in {"qwen-turbo-chat", "qwen-plus-chat"}:
@@ -240,6 +248,8 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         extra_headers_str = ''
         if model_parameters.get('extra_headers',''):
             extra_headers_str = model_parameters.pop('extra_headers')
+        # [CUSTOM-i] Backward-compatible fallback; never pass this private Dify parameter to DashScope.
+        workflow_run_id = workflow_run_id or model_parameters.pop("_dify_workflow_run_id", None)
 
         params = {
             "model": model,
@@ -323,7 +333,7 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                 base_address=base_address,
             )
         # [CUSTOM-i] Pass debug_logging flag from provider credentials
-        debug_logging = credentials.get("debug_logging", "false") == "true"
+        debug_logging = str(credentials.get("debug_logging", "false")).lower() == "true"
         if stream:
             return self._handle_generate_stream_response(
                 model,
@@ -332,9 +342,15 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                 prompt_messages,
                 incremental_output,
                 debug_logging=debug_logging,
+                workflow_run_id=workflow_run_id,
             )
         return self._handle_generate_response(
-            model, credentials, response, prompt_messages, debug_logging=debug_logging
+            model,
+            credentials,
+            response,
+            prompt_messages,
+            debug_logging=debug_logging,
+            workflow_run_id=workflow_run_id,
         )
 
     def _handle_generate_response(
@@ -344,6 +360,7 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         response: GenerationResponse,
         prompt_messages: list[PromptMessage],
         debug_logging: bool = False,
+        workflow_run_id: Optional[str] = None,
     ) -> LLMResult:
         """
         Handle llm response
@@ -384,7 +401,13 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
             )
             # [CUSTOM-i] Log request_id for tracing with Alibaba Cloud support (controlled by debug_logging credential)
             if debug_logging:
-                logger.info("dashscope model=%s request_id=%s", model, response.request_id)
+                logger.warning(
+                    "🔍 [dashscope] workflow_run_id=%s model=%s request_id=%s full_text=%r",
+                    workflow_run_id,
+                    model,
+                    response.request_id,
+                    str(resp_content)[:500],
+                )
             return result
         finally:
             self._cleanup_temp_files()
@@ -419,6 +442,7 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         prompt_messages: list[PromptMessage],
         incremental_output: bool,
         debug_logging: bool = False,
+        workflow_run_id: Optional[str] = None,
     ) -> Generator:
         """
         Handle llm stream response
@@ -484,9 +508,12 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                     )
                     # [CUSTOM-i] Log request_id and merged response content for tracing with Alibaba Cloud support
                     if debug_logging:
-                        logger.info(
-                            "dashscope model=%s request_id=%s full_text=%.500s",
-                            model, response.request_id, full_text,
+                        logger.warning(
+                            "🔍 [dashscope] workflow_run_id=%s model=%s request_id=%s full_text=%r",
+                            workflow_run_id,
+                            model,
+                            response.request_id,
+                            full_text[:500],
                         )
                     yield LLMResultChunk(
                         model=model,
