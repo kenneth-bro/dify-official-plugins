@@ -406,7 +406,7 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                     workflow_run_id,
                     model,
                     response.request_id,
-                    str(resp_content)[:500],
+                    str(resp_content),
                 )
             return result
         finally:
@@ -513,7 +513,7 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                             workflow_run_id,
                             model,
                             response.request_id,
-                            full_text[:500],
+                            full_text,
                         )
                     yield LLMResultChunk(
                         model=model,
