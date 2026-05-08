@@ -303,6 +303,25 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         if model.startswith("qwen3-omni-") and not stream:
             params["enable_omni_output_audio_url"] = True
 
+        # [CUSTOM-i] Log model request parameters except prompt messages and credentials for troubleshooting.
+        debug_logging = str(credentials.get("debug_logging", "false")).lower() == "true"
+        if debug_logging:
+            request_params = {
+                key: value
+                for key, value in params.items()
+                if key not in {"messages", "api_key"}
+            }
+            request_params["user"] = user
+            request_params["stream"] = stream
+            request_params["incremental_output"] = incremental_output
+            request_params["base_address"] = base_address
+            logger.warning(
+                "🔍 [dashscope-params] workflow_run_id=%s model=%s params=%r",
+                workflow_run_id,
+                model,
+                request_params,
+            )
+
         if ModelFeature.VISION in (model_schema.features or []):
             params["messages"] = self._convert_prompt_messages_to_tongyi_messages(
                 credentials, prompt_messages, rich_content=True
@@ -332,8 +351,6 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                 incremental_output=incremental_output,
                 base_address=base_address,
             )
-        # [CUSTOM-i] Pass debug_logging flag from provider credentials
-        debug_logging = str(credentials.get("debug_logging", "false")).lower() == "true"
         if stream:
             return self._handle_generate_stream_response(
                 model,
