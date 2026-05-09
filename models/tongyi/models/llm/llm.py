@@ -221,8 +221,6 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         mode = self.get_model_mode(model, credentials)
         if model in {"qwen-turbo-chat", "qwen-plus-chat"}:
             model = model.replace("-chat", "")
-        # [CUSTOM-i] Replace the selected model with the actual DashScope model from TONGYI_MODEL_ALIAS_MAP.
-        model = self._resolve_actual_model(model)
 
         extra_model_kwargs = {}
         if tools:
@@ -280,13 +278,15 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         # [CUSTOM-i] Backward-compatible fallback; never pass this private Dify parameter to DashScope.
         workflow_run_id = workflow_run_id or model_parameters.pop("_dify_workflow_run_id", None)
 
+        model_schema = self.get_model_schema(model, credentials)
+        # [CUSTOM-i] Replace only the DashScope request model after resolving Dify schema/features from the selected model.
+        model = self._resolve_actual_model(model)
         params = {
             "model": model,
             **model_parameters,
             **credentials_kwargs,
             **extra_model_kwargs,
         }
-        model_schema = self.get_model_schema(model, credentials)
 
         incremental_output = False if tools else stream
 
