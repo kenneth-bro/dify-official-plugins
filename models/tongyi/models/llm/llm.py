@@ -73,6 +73,9 @@ if plugin_logger_handler not in logger.handlers:
     logger.addHandler(plugin_logger_handler)
 logger.propagate = False
 
+MODEL_ALIAS_ENV_NAME = "TONGYI_MODEL_ALIAS_MAP"  # [CUSTOM-i] Deployment-level model alias env var.
+DEFAULT_MODEL_ALIAS_MAP = ""  # [CUSTOM-i] Empty by default; aliases only apply when explicitly configured.
+
 
 class TongyiLargeLanguageModel(LargeLanguageModel):
     tokenizers = {}
@@ -80,6 +83,29 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._temp_files = []
+
+    @staticmethod
+    def _parse_model_alias_map(alias_map_config: Optional[str]) -> dict[str, str]:
+        # [CUSTOM-i] Parse model alias pairs: qwen3.5-plus=qwen3.5-plus-2026-04-20,qwen-plus=qwen-plus-latest.
+        if not alias_map_config:
+            return {}
+
+        alias_map = {}
+        for item in alias_map_config.split(","):
+            if "=" not in item:
+                continue
+            source, target = item.split("=", 1)
+            source = source.strip()
+            target = target.strip()
+            if source and target:
+                alias_map[source] = target
+        return alias_map
+
+    @classmethod
+    def _resolve_actual_model(cls, requested_model: str) -> str:
+        # [CUSTOM-i] Allow deployment-level model aliasing without changing Dify workflow model selections.
+        alias_map = cls._parse_model_alias_map(os.getenv(MODEL_ALIAS_ENV_NAME, DEFAULT_MODEL_ALIAS_MAP))
+        return alias_map.get(requested_model, requested_model)
 
     def _invoke(
         self,
@@ -195,6 +221,9 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         mode = self.get_model_mode(model, credentials)
         if model in {"qwen-turbo-chat", "qwen-plus-chat"}:
             model = model.replace("-chat", "")
+        # [CUSTOM-i] Replace the selected model with the actual DashScope model from TONGYI_MODEL_ALIAS_MAP.
+        model = self._resolve_actual_model(model)
+
         extra_model_kwargs = {}
         if tools:
             extra_model_kwargs["tools"] = self._convert_tools(tools)
