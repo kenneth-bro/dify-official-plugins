@@ -75,6 +75,21 @@ logger.propagate = False
 
 MODEL_ALIAS_ENV_NAME = "TONGYI_MODEL_ALIAS_MAP"  # [CUSTOM-i] Deployment-level model alias env var.
 DEFAULT_MODEL_ALIAS_MAP = ""  # [CUSTOM-i] Empty by default; aliases only apply when explicitly configured.
+PROMPT_LOG_PREVIEW_CHARS = 300  # [CUSTOM-i] Keep prompt previews short enough for daemon logs.
+REQUEST_LOG_TEXT_PREVIEW_CHARS = 500  # [CUSTOM-i] Truncate final DashScope request snapshots in debug logs.
+# [CUSTOM-i] DashScope explicit context cache customization. Manual mode is system-prompt only.
+CONTEXT_CACHE_MODE_ENV_NAME = "TONGYI_CONTEXT_CACHE_MODE"  # [CUSTOM-i] off|manual.
+CONTEXT_CACHE_OFF = "off"
+CONTEXT_CACHE_MANUAL = "manual"
+CONTEXT_CACHE_START_TAG = "<cache>"
+CONTEXT_CACHE_END_TAG = "</cache>"
+CONTEXT_CACHE_MAX_MARKERS = 4
+CONTEXT_CACHE_SUPPORTED_MODELS = {
+    "qwen3.6-plus",
+    "qwen3.5-plus",
+    "qwen3.5-flash",
+    "qwen-plus",
+}
 
 
 class TongyiLargeLanguageModel(LargeLanguageModel):
@@ -106,6 +121,247 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         # [CUSTOM-i] Allow deployment-level model aliasing without changing Dify workflow model selections.
         alias_map = cls._parse_model_alias_map(os.getenv(MODEL_ALIAS_ENV_NAME, DEFAULT_MODEL_ALIAS_MAP))
         return alias_map.get(requested_model, requested_model)
+
+    @staticmethod
+    def _prompt_text_preview(prompt_messages: list[PromptMessage]) -> str:
+        # [CUSTOM-i] Log only textual prompt fragments; skip binary/media payloads and keep the line compact.
+        fragments: list[str] = []
+        for prompt_message in prompt_messages:
+            role = getattr(prompt_message.role, "value", str(prompt_message.role))
+            content = prompt_message.content
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text_parts = [
+                    data
+                    for item in content
+                    if getattr(item, "type", None) == PromptMessageContentType.TEXT
+                    and isinstance(data := getattr(item, "data", None), str)
+                ]
+                text = "\n".join(text_parts)
+            else:
+                text = str(content)
+
+            text = " ".join(text.split())
+            if text:
+                fragments.append(f"{role}: {text}")
+
+        return "\n".join(fragments)[:PROMPT_LOG_PREVIEW_CHARS]
+
+    @classmethod
+    def _sanitize_dashscope_log_value(cls, value):
+        # [CUSTOM-i] Redact secrets and truncate long strings before emitting DashScope debug logs.
+        if isinstance(value, dict):
+            sanitized = {}
+            for key, item in value.items():
+                if str(key).lower() in {"api_key", "dashscope_api_key", "authorization"}:
+                    sanitized[key] = "***"
+                else:
+                    sanitized[key] = cls._sanitize_dashscope_log_value(item)
+            return sanitized
+        if isinstance(value, list):
+            return [cls._sanitize_dashscope_log_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._sanitize_dashscope_log_value(item) for item in value)
+        if isinstance(value, str):
+            if len(value) > REQUEST_LOG_TEXT_PREVIEW_CHARS:
+                return f"{value[:REQUEST_LOG_TEXT_PREVIEW_CHARS]}...<truncated>"
+            return value
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if hasattr(value, "model_dump"):
+            return cls._sanitize_dashscope_log_value(value.model_dump())
+        if hasattr(value, "to_dict"):
+            return cls._sanitize_dashscope_log_value(value.to_dict())
+        if hasattr(value, "__dict__"):
+            return cls._sanitize_dashscope_log_value(
+                {
+                    key: item
+                    for key, item in vars(value).items()
+                    if not key.startswith("_")
+                }
+            )
+        return repr(value)
+
+    @classmethod
+    def _dashscope_request_for_log(
+        cls,
+        params: dict,
+        headers: dict,
+        stream: bool,
+        incremental_output: bool,
+        base_address: str,
+        user: Optional[str],
+    ) -> dict:
+        # [CUSTOM-i] Capture the final provider request after message conversion and cache_control injection.
+        request_params = dict(params)
+        request_params["headers"] = headers
+        request_params["stream"] = stream
+        request_params["incremental_output"] = incremental_output
+        request_params["base_address"] = base_address
+        request_params["user"] = user
+        return cls._sanitize_dashscope_log_value(request_params)
+
+    @classmethod
+    def _dashscope_usage_for_log(cls, response: GenerationResponse):
+        # [CUSTOM-i] Preserve raw DashScope usage fields, including cache-hit counters when the SDK returns them.
+        return cls._sanitize_dashscope_log_value(getattr(response, "usage", None))
+
+    @staticmethod
+    def _normalize_context_cache_mode(mode: Optional[str]) -> str:
+        # [CUSTOM-i] Keep unknown cache modes fail-closed so old workflows continue without cache markers.
+        normalized = (mode or CONTEXT_CACHE_OFF).strip().lower()
+        if normalized in {
+            CONTEXT_CACHE_OFF,
+            CONTEXT_CACHE_MANUAL,
+        }:
+            return normalized
+        return CONTEXT_CACHE_OFF
+
+    @staticmethod
+    def _supports_dashscope_context_cache(model: str) -> bool:
+        # [CUSTOM-i] Runtime gate mirrors the enabled predefined model YAMLs instead of all qwen aliases.
+        return model in CONTEXT_CACHE_SUPPORTED_MODELS
+
+    @staticmethod
+    def _text_cache_block(text: str, cached: bool = False) -> dict:
+        # [CUSTOM-i] DashScope explicit cache marker uses Anthropic-style cache_control blocks.
+        block = {"type": "text", "text": text}
+        if cached:
+            block["cache_control"] = {"type": "ephemeral"}
+        return block
+
+    @classmethod
+    def _split_manual_cache_blocks(cls, text: str) -> Optional[list[dict]]:
+        # [CUSTOM-i] Strip <cache> tags before provider calls and mark only their enclosed text.
+        if CONTEXT_CACHE_START_TAG not in text or CONTEXT_CACHE_END_TAG not in text:
+            return None
+
+        blocks = []
+        rest = text
+        while CONTEXT_CACHE_START_TAG in rest:
+            before, after_start = rest.split(CONTEXT_CACHE_START_TAG, 1)
+            if CONTEXT_CACHE_END_TAG not in after_start:
+                if before:
+                    blocks.append(cls._text_cache_block(before))
+                blocks.append(cls._text_cache_block(CONTEXT_CACHE_START_TAG + after_start))
+                return blocks
+
+            cached, rest = after_start.split(CONTEXT_CACHE_END_TAG, 1)
+            if before:
+                blocks.append(cls._text_cache_block(before))
+            if cached:
+                blocks.append(cls._text_cache_block(cached, cached=True))
+
+        if rest:
+            blocks.append(cls._text_cache_block(rest))
+        return blocks
+
+    @staticmethod
+    def _has_manual_cache_tags(messages: list[dict]) -> bool:
+        # [CUSTOM-i] Manual cache tags are recognized only in system prompts.
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                if CONTEXT_CACHE_START_TAG in content and CONTEXT_CACHE_END_TAG in content:
+                    return True
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    text = block.get("text")
+                    if (
+                        isinstance(text, str)
+                        and CONTEXT_CACHE_START_TAG in text
+                        and CONTEXT_CACHE_END_TAG in text
+                    ):
+                        return True
+        return False
+
+    @classmethod
+    def _limit_context_cache_markers(cls, messages: list[dict]) -> None:
+        # [CUSTOM-i] DashScope accepts up to four cache markers; keep the newest system markers.
+        marker_blocks = []
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and "cache_control" in block:
+                    marker_blocks.append(block)
+
+        for block in marker_blocks[:-CONTEXT_CACHE_MAX_MARKERS]:
+            block.pop("cache_control", None)
+
+    @classmethod
+    def _apply_manual_cache_tags(cls, messages: list[dict]) -> None:
+        # [CUSTOM-i] If any system <cache> tag exists, only tagged system text is cached.
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                blocks = cls._split_manual_cache_blocks(content)
+                if blocks:
+                    message["content"] = blocks
+            elif isinstance(content, list):
+                converted_content = []
+                changed = False
+                for block in content:
+                    if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                        converted_content.append(block)
+                        continue
+
+                    blocks = cls._split_manual_cache_blocks(block["text"])
+                    if blocks:
+                        converted_content.extend(blocks)
+                        changed = True
+                    else:
+                        converted_content.append(block)
+                if changed:
+                    message["content"] = converted_content
+
+    @classmethod
+    def _apply_whole_text_context_cache(cls, messages: list[dict]) -> None:
+        # [CUSTOM-i] Manual mode fallback: no system <cache> tags means cache the whole system prompt.
+        for message in messages:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = [cls._text_cache_block(content, cached=True)]
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                        continue
+                    block["type"] = "text"
+                    block["cache_control"] = {"type": "ephemeral"}
+
+    @classmethod
+    def _apply_manual_context_cache(cls, messages: list[dict]) -> None:
+        # [CUSTOM-i] Implements the user-facing manual rule for system prompts only.
+        if cls._has_manual_cache_tags(messages):
+            cls._apply_manual_cache_tags(messages)
+        else:
+            cls._apply_whole_text_context_cache(messages)
+
+    @classmethod
+    def _apply_dashscope_context_cache(
+        cls, messages: list[dict], mode: str, model: str
+    ) -> list[dict]:
+        # [CUSTOM-i] Apply DashScope cache_control after Dify message conversion and before SDK invocation.
+        if mode == CONTEXT_CACHE_OFF or not cls._supports_dashscope_context_cache(model):
+            return messages
+
+        if mode == CONTEXT_CACHE_MANUAL:
+            cls._apply_manual_context_cache(messages)
+
+        cls._limit_context_cache_markers(messages)
+        return messages
 
     def _invoke(
         self,
@@ -275,10 +531,18 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         extra_headers_str = ''
         if model_parameters.get('extra_headers',''):
             extra_headers_str = model_parameters.pop('extra_headers')
+        # [CUSTOM-i] Provider-specific cache switch is consumed locally and never forwarded to DashScope.
+        context_cache_mode = self._normalize_context_cache_mode(
+            model_parameters.pop(
+                "context_cache_mode",
+                os.getenv(CONTEXT_CACHE_MODE_ENV_NAME, CONTEXT_CACHE_OFF),
+            )
+        )
         # [CUSTOM-i] Backward-compatible fallback; never pass this private Dify parameter to DashScope.
         workflow_run_id = workflow_run_id or model_parameters.pop("_dify_workflow_run_id", None)
 
         model_schema = self.get_model_schema(model, credentials)
+        selected_model = model
         # [CUSTOM-i] Replace only the DashScope request model after resolving Dify schema/features from the selected model.
         model = self._resolve_actual_model(model)
         params = {
@@ -345,9 +609,10 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
             request_params["incremental_output"] = incremental_output
             request_params["base_address"] = base_address
             logger.warning(
-                "🔍 [dashscope-params] workflow_run_id=%s model=%s params=%r",
+                "🔍 [dashscope-params] workflow_run_id=%s model=%s prompt_preview=%r params=%r",
                 workflow_run_id,
                 model,
+                self._prompt_text_preview(prompt_messages),
                 request_params,
             )
 
@@ -358,6 +623,19 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
             # [CUSTOM-i] Disable Alibaba Cloud content inspection (绿网) and merge with market bury point header
             _call_headers = self._get_market_bury_point_header(params["messages"], extra_headers_str)
             _call_headers["X-DashScope-DataInspection"] = '{"input":"disable","output":"disable"}'
+            # [CUSTOM-i] Preserve selected Dify model as the cache support gate even when request model is aliased.
+            params["messages"] = self._apply_dashscope_context_cache(
+                params["messages"], context_cache_mode, selected_model
+            )
+            if debug_logging:
+                logger.warning(
+                    "🔍 [dashscope-request] workflow_run_id=%s model=%s request=%r",
+                    workflow_run_id,
+                    model,
+                    self._dashscope_request_for_log(
+                        params, _call_headers, stream, incremental_output, base_address, user
+                    ),
+                )
             response = MultiModalConversation.call(
                 **params,
                 stream=stream,
@@ -372,6 +650,19 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
             # [CUSTOM-i] Disable Alibaba Cloud content inspection (绿网) and merge with market bury point header
             _call_headers = self._get_market_bury_point_header(params["messages"], extra_headers_str)
             _call_headers["X-DashScope-DataInspection"] = '{"input":"disable","output":"disable"}'
+            # [CUSTOM-i] Preserve selected Dify model as the cache support gate even when request model is aliased.
+            params["messages"] = self._apply_dashscope_context_cache(
+                params["messages"], context_cache_mode, selected_model
+            )
+            if debug_logging:
+                logger.warning(
+                    "🔍 [dashscope-request] workflow_run_id=%s model=%s request=%r",
+                    workflow_run_id,
+                    model,
+                    self._dashscope_request_for_log(
+                        params, _call_headers, stream, incremental_output, base_address, user
+                    ),
+                )
             response = Generation.call(
                 **params,
                 headers=_call_headers,
@@ -448,10 +739,11 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
             # [CUSTOM-i] Log request_id for tracing with Alibaba Cloud support (controlled by debug_logging credential)
             if debug_logging:
                 logger.warning(
-                    "🔍 [dashscope] workflow_run_id=%s model=%s request_id=%s full_text=%r",
+                    "🔍 [dashscope] workflow_run_id=%s model=%s request_id=%s usage=%r full_text=%r",
                     workflow_run_id,
                     model,
                     response.request_id,
+                    self._dashscope_usage_for_log(response),
                     str(resp_content),
                 )
             return result
@@ -555,10 +847,11 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                     # [CUSTOM-i] Log request_id and merged response content for tracing with Alibaba Cloud support
                     if debug_logging:
                         logger.warning(
-                            "🔍 [dashscope] workflow_run_id=%s model=%s request_id=%s full_text=%r",
+                            "🔍 [dashscope] workflow_run_id=%s model=%s request_id=%s usage=%r full_text=%r",
                             workflow_run_id,
                             model,
                             response.request_id,
+                            self._dashscope_usage_for_log(response),
                             full_text,
                         )
                     yield LLMResultChunk(

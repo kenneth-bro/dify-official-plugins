@@ -90,6 +90,21 @@ parameter_rules:
     options:
       - text
       - json_object
+  # [CUSTOM-i] DashScope explicit context cache switch for enabled predefined Tongyi models.
+  - name: context_cache_mode
+    required: false
+    type: string
+    default: "off"
+    label:
+      zh_Hans: 上下文缓存模式
+      en_US: Context Cache Mode
+    options:
+      - "off"
+      - "manual"
+    help:
+      zh_Hans: off 关闭；manual 缓存 <cache></cache> 标记内的内容。仅 DashScope 支持显式缓存的模型会实际发送 cache_control。
+      en_US: off disables caching; manual caches content wrapped in <cache></cache>. cache_control is only sent for DashScope models that support explicit context cache.
+
   - name: extra_headers
     required: false
     type: string
