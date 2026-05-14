@@ -150,12 +150,12 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
 
     @classmethod
     def _sanitize_dashscope_log_value(cls, value):
-        # [CUSTOM-i] Redact secrets and truncate long strings before emitting DashScope debug logs.
+        # [CUSTOM-i] Mask secrets and truncate long strings before emitting DashScope debug logs.
         if isinstance(value, dict):
             sanitized = {}
             for key, item in value.items():
                 if str(key).lower() in {"api_key", "dashscope_api_key", "authorization"}:
-                    sanitized[key] = "***"
+                    sanitized[key] = cls._mask_secret_for_log(item)
                 else:
                     sanitized[key] = cls._sanitize_dashscope_log_value(item)
             return sanitized
@@ -182,6 +182,18 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                 }
             )
         return repr(value)
+
+    @staticmethod
+    def _mask_secret_for_log(value) -> str:
+        # [CUSTOM-i] Show enough of DashScope API keys for credential routing checks without exposing the full secret.
+        if value is None:
+            return ""
+        text = str(value)
+        if text.lower().startswith("bearer "):
+            return f"Bearer {TongyiLargeLanguageModel._mask_secret_for_log(text[7:])}"
+        if len(text) <= 10:
+            return "******"
+        return f"{text[:5]}******{text[-5:]}"
 
     @classmethod
     def _dashscope_request_for_log(
@@ -602,7 +614,7 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
             request_params = {
                 key: value
                 for key, value in params.items()
-                if key not in {"messages", "api_key"}
+                if key not in {"messages"}
             }
             request_params["user"] = user
             request_params["stream"] = stream
@@ -613,7 +625,7 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
                 workflow_run_id,
                 model,
                 self._prompt_text_preview(prompt_messages),
-                request_params,
+                self._sanitize_dashscope_log_value(request_params),
             )
 
         if ModelFeature.VISION in (model_schema.features or []):

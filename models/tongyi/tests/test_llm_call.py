@@ -152,7 +152,7 @@ def test_dashscope_request_log_includes_cache_control_and_redacts_secrets() -> N
     request = TongyiLargeLanguageModel._dashscope_request_for_log(
         params={
             "model": "qwen-plus",
-            "api_key": "secret-key",
+            "api_key": "1234567890ABCDE",
             "messages": [
                 {
                     "role": "system",
@@ -166,18 +166,25 @@ def test_dashscope_request_log_includes_cache_control_and_redacts_secrets() -> N
                 }
             ],
         },
-        headers={"Authorization": "Bearer secret", "X-DashScope-DataInspection": "{}"},
+        headers={
+            "Authorization": "Bearer abcdefghijklmno",
+            "X-DashScope-DataInspection": "{}",
+        },
         stream=False,
         incremental_output=False,
         base_address="https://dashscope.aliyuncs.com/api/v1",
         user="test-user",
     )
 
-    assert request["api_key"] == "***"
-    assert request["headers"]["Authorization"] == "***"
+    assert request["api_key"] == "12345******ABCDE"
+    assert request["headers"]["Authorization"] == "Bearer abcde******klmno"
     assert request["messages"][0]["content"][0]["cache_control"] == {
         "type": "ephemeral"
     }
+
+
+def test_dashscope_secret_mask_handles_short_values() -> None:
+    assert TongyiLargeLanguageModel._mask_secret_for_log("short") == "******"
 
 
 def test_dashscope_usage_log_preserves_cache_usage_fields() -> None:
